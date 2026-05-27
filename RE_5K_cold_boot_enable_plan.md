@@ -52,7 +52,14 @@ Findings from the 2026-05-15 CoreEG2 pass:
 - During second-connector setup, CoreEG2 sends opcode/address `1265` (`0x4F1`) with payload `1` through the root connector backend, stalls `10 ms`, then searches for a sibling connector whose connector id is root id plus one.
 - The sibling connector must expose an Apple internal-panel record matching byte `0xAE`, big-endian word `0x0610`, and `(flags & 3) == 2`.
 - If second-connector validation fails, CoreEG2 sends opcode/address `1265` with payload `0` through the same root connector backend before returning to generic fallback.
-- After the paired path succeeds, CoreEG2 link-trains both connectors and publishes `ComplexDisplaySetup` through the platform-info backend.
+- After the paired path succeeds, CoreEG2 link-trains both connectors and publishes `ComplexDisplaySetup` through the Device Path Property Database provider.
+
+2026-05-20 provider correction:
+
+- `qword_E660` is the Platform Info Database provider (`AC5E4829-A8FD-440B-AF33-9FFE013B12D8`) used for the `dword_E670` policy read.
+- `qword_E668` is the Device Path Property Database provider (`91BD12FE-F6C3-44FB-A5B7-5122AB303AE0`) used for `SavedConfig`, `ComplexDisplaySetup`, AUX power, backlight/gamma, and failure records.
+- CoreEG2's generic restore path reads `SavedConfig` through `qword_E668` and calls GOP device-protocol slot `+0x38` (`GopApplySavedDisplayConfiguration`).
+- CoreEG2's complex 5K path builds the 384-byte two-endpoint replay record and calls GOP device-protocol slot `+0x40` (`GopReplaySavedDisplayConfiguration`).
 
 Implication:
 
@@ -80,6 +87,58 @@ Findings from the 2026-05-15 GOP pass:
 - `GopPublishDpcdTrainingProperties` programs normal DP DPCD training addresses through the same extended opcode transport: `0x100`, `0x101`, `0x102`, `0x103`, `0x107`, `0x108`, and reads training status from `0x202`.
 - GOP has an optional `0x10A` write path gated by internal flags, matching the Windows/Linux suspicion that `0x10A` is part of the Apple panel policy.
 - `GopRefreshConnectorStateSlotFromExtendedWindows` skips broad extended ranges including `0x410..0x4FF`; this makes CoreEG2's `0x4F1` write look deliberate rather than a generic connector-state refresh side effect.
+- Selector `5` is a status gate, not the class byte. CoreEG2 reads one byte and checks `(reply[0] & 6) == 2`; the class byte later accepted as `0x10..0x14` comes from the first byte of the 16-byte opcode/window `0` classification block.
+- For grouped/internal mask `0xF00`, GOP marks grouped-live state from grouped state-slot byte `+25`. That state upgrades grouped packet subtype `19 -> 20` and gates the special grouped custom-rate path.
+
+2026-05-20 grouped-slot refinement:
+
+- No GOP C-code writer for grouped state-slot byte `+25` has been found.
+- `GopRefreshConnectorStateSlotFromExtendedWindows` reads extended opcode/window `0x000`, length `16`, into `slot+12..slot+27`; `slot+25` is byte `13` returned by the lower connector mailbox.
+- For current mask `0xF00`, that lower byte is copied into GOP device byte `+18932`, the grouped-live latch.
+- The known refresh callers are `GopPrepareDpTrainingStateForSelectedMask`, `GopTrainDetectedDpOutputByMask`, `GopTrainConnectorMaskWithDpTrainingLoop`, and `GopValidateAndRefreshConnectorStateSlot`.
+- Connector-record cache population probes ordinary DP masks (`0x100..0x400`) and does not directly populate grouped `0xF00`.
+- `GopSelectConnectorMaskFromSavedState` keeps only `0xF00` when the saved mode type is `0xB`, meaning an Apple saved state can intentionally route GOP into the grouped internal DP family. It still depends on the lower mailbox byte becoming nonzero to reach grouped-live/subtype `20`.
+- 2026-05-20 focused collapse-fork correction: CoreEG2's direct root/sibling complex-display decision uses the individual GOP connector objects, not grouped `0xF00` first. Connector id `1` is backend mask `0x100` / record-cache index `4`; connector id `2` is backend mask `0x200` / record-cache index `3`. The root-side `0x4F1 = 1` pulse is sent through the root connector backend, then CoreEG2 asks the sibling connector for its `0xA0` record and validates the Apple internal-panel bytes. So the immediate plain-boot collapse suspect is the individual sibling `0x200` record/cache becoming absent or non-Apple after the pulse.
+- 2026-05-20 lower readiness gate: before GOP reads the selected connector's `0xA0` record, it calls `GopWaitForConnectorMaskReady` on the connector's supported mask. Root connector id `1` / supported mask `0x120` waits on MMIO `0x1223C` bit `0x100`; sibling connector id `2` / supported mask `0x220` waits on bit `0x00000001`. Both use a short poll loop because bit `0x20` is present in the supported mask. This makes the earliest measurable good-vs-plain difference: does the root-side `0x4F1 = 1` pulse cause the sibling readiness bit to assert so the `0x200`/index-3 `0xA0` record can be read?
+- Immediate search found no GOP C-side writer for MMIO `0x1223C`; it is read in readiness/transaction paths. So the sibling-ready bit appears to be a lower hardware/mailbox status bit, not a direct firmware variable.
+- `boot.efi.i64` recheck result from 2026-05-20: `boot.efi` connects, opens, and queries graphics state but does not appear to be the missing DPCD/tile initializer. It has no direct `0x4F1` / 1265 reference. Its `gfx-saved-config-restore-status` string is referenced only by `ConnectGraphicsDevices`, which reads that Apple NVRAM restore-status variable after calling Apple graphics-connect protocol slots for `ConnectAll` / `ConnectDisplay`.
+- The `8ECE08D8-A6D4-430B-A7B0-2DF318E7884A` Apple graphics-connect protocol used by `boot.efi` is present in `AppleBds.efi` and `SlingShot.efi`, not in CoreEG2/GOP. `AppleBds.efi` also has `START:ConnectGfxDevs`, `START:ConnectController`, `END:ConnectController`, `END:ConnectGfxDevs`, and `CoreEG2` strings. Local disassembly shows the AppleBds protocol table slot `+0x08` at `AppleBds.efi+0x11159` calls a `ConnectGfxDevs`-looking routine at `+0x712F`, which eventually calls UEFI `BootServices->ConnectController(..., Recursive=TRUE)` for selected graphics handles. This is probably the Apple-path trigger systemd-boot is missing.
+- `AppleBds.efi` IDA refinement: that selected-handle logic enumerates `EFI_PCI_IO_PROTOCOL_GUID`, reads PCI config space, filters for PCI base class `0x03` display controllers, then prioritizes handles whose config data contains Apple vendor/subsystem value `0x106B`. The priority-`1` records are the ones that enter the logged `START:ConnectController` path. After the recursive connect succeeds, AppleBds enumerates GOP handles and matches their device paths back to the same PCI controller.
+- `AppleBds.efi` boot-target classification refinement: no explicit `BootCamp`, `Windows`, or `Microsoft` string was found in AppleBds. The split is a positive Apple-volume test:
+  - `AppleBdsEvaluateExtendedBootPolicy` resolves the selected boot path to Simple FS, then calls `AppleBdsGetAppleBootVolumeIdentity`.
+  - That helper probes root `GetInfo` GUIDs `900C7693-8C14-58BA-B44E-974515D27C78` and `FA99420C-88F1-11E7-95F6-B8E8562CBAFA`, then falls back to `APPLE_PARTITION_INFO_PROTOCOL_GUID`.
+  - Accepted Apple partition evidence includes `Apple_Boot`, `Apple_HFS`, `Apple_HFSX`, `Apple_Recovery`, or matching Apple partition type GUID encodings.
+  - If no Apple identity flag is set, AppleBds forces extended-boot result type `1`, the normal generic EFI boot path. So BootCamp/systemd-boot/plain EFI currently look like the negative case: not Apple-identified, not a named BootCamp branch.
+- AppleBds BootCamp false-lead cleanup: the `#[BDS|BC:SS]` log is boot-chime/startup-sound handling, not BootCamp. It reads startup sound/mute/panic/battery variables and logs `BootChimeOnLastBoot` through DataHub. Comments were added in the AppleBds IDB so this is not chased again.
+- `BootPicker.efi` still contains the interesting Windows-side strings (`Windows`, `WININSTALL`, `Efi Boot`). If real BootCamp cold-boot reaches 5K, BootPicker/AppleBootPolicy is now the next firmware RE target for a Windows-specific graphics-connect or boot-entry path.
+- BootPicker RE update after loading `BootPicker.efi` with efiXplorer:
+  - `BootPickerClassifyFsBootTarget` (`+0x3133`) probes Simple FS/Block IO, checks for `\EFI\Microsoft\Boot\bootmgfw.efi`, and recognizes `WININSTALL` installer media from the block-device boot sector.
+  - `BootPickerClassifyHandleDeviceKind` (`+0x2ED2`) keeps a `0x80000` Windows marker only when that classifier returns normal Windows class `2`.
+  - `BootPickerBuildChoiceUiEntry` (`+0x34F6`) consumes those class codes to build the visible boot picker choice and select labels/icons (`Windows`, `Efi Boot`, disk label, etc.).
+  - `BootPickerResolveConsoleGopForUi` (`+0x105D0`) only resolves a usable GOP for BootPicker UI and `UIScale`; it does not call the GOP BootCamp protocol, CoreEG2 shared graphics, DPCD/AUX, or tiled-display code.
+  - GUID/string scans still show no embedded `GOP_BOOTCAMP_SUPPORT`, `APPLE_BDS_GRAPHICS_CONNECT`, `EFI_OS_INFO`, `APPLE_SHARED_GRAPHICS`, `CoreEG2`, `DPCD`, `AUX`, or tile strings in BootPicker.
+  - IDA comments/renames were saved for these functions and key branches. Current conclusion: BootPicker is Windows-aware, but the visible code path is boot-entry metadata/UI, not direct 5K replay creation.
+- Nuance after OCLP observation: this classifier is not the whole OCLP explanation. OCLP/OpenCore can live on a generic EFI partition yet still trigger the good graphics state. The likely separate trigger is OpenCore's UEFI graphics/driver connection machinery (`ConnectDrivers`, `ReconnectGraphicsOnConnect`, `ProvideConsoleGop`, `GopPassThrough`, `DirectGopRendering`) causing GOP/CoreEG2 graphics drivers to reconnect/provide console graphics in a different order.
+- Therefore, "Apple mode" should not be treated as one switch. There is an Apple boot-target classifier, and there may also be an independent preboot graphics-connect trigger that OCLP exercises.
+- BootCamp firmware support checkpoint from the GOP pass:
+  - The Polaris GOP publishes `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID = A3249A94-CB66-43FC-92F3-8BA1889FD6C7`.
+  - GOP driver-binding start installs that protocol after the GOP device, connector, and framebuffer protocols. The published interface is GOP display-state `+0x320`; slot `+0x08` is `GopBootCampPrepareLinkState`.
+  - `GopBootCampPrepareLinkState` is not a full DPCD/tile init path. With `a2 == 1 || a2 == 2` it runs `GopApplyBootCampLinkRegisterSequence(..., 0xF4000000)`, a GPU MMIO handoff sequence that can touch either the current endpoint or all GOP replay endpoints when multi-display state is active.
+  - The MMIO sequence toggles CRTC blank-control bit `0x100`, writes global registers `0x2024` and `0x2C04`, pokes DCP primary-surface address/high registers, then restores the blank bit.
+  - `GopApplyBootCampLinkRegisterSequence` depends on GOP replay state. `state+2216`/`state+2212` are set by `GopReplaySavedDisplayConfiguration(non-NULL)` and cleared by the cleanup/`NULL` replay call. This makes the BootCamp method a consumer of paired display state, not the code that creates that state from scratch.
+  - GOP endpoint bank mapping is now decoded: backend mask `0x100` maps to output bank `0`, `0x200` maps to bank `1`, and grouped `0xF00` maps to bank `0`. A useful dual-tile BootCamp handoff therefore requires replay endpoints that resolve to split connector masks `0x100/0x200`.
+  - PlatformInit caller side is confirmed. `PlatformInitCallGopBootCampSupport` (`PlatformInit.efi+0x1170`) is registered as an `EVT_SIGNAL_EXIT_BOOT_SERVICES` callback, locates handles publishing `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID`, opens the protocol with `EFI_OPEN_PROTOCOL_GET_PROTOCOL`, checks version `0x10000`, then calls slot `+0x08` as `(iface, 1, 2, 0, 0, 0)`.
+  - Therefore GOP receives `a2 == 1` and `a3 == 2`, so this callback triggers the real `0xF4000000` MMIO handoff path rather than the GOP method's `a3 == 1` no-op path.
+  - The one known suppressor is `PlatformInitSkipBootCampSupportCall`; the only writer found so far is `PlatformInitSetSkipBootCampSupportCall` (`PlatformInit.efi+0x13D1`), a protocol-notify callback for GUID `0DFD015E-A1BB-4E63-8372-89BD526DE956`.
+  - `boot.efi` is the Apple-side source of that suppressor: it locates `EFI_OS_INFO_PROTOCOL_GUID = C5C5DA95-7D5C-45E6-B2F1-3FD52BB10077`, calls slot `+0x08` with `"macOS 11.0"`, then slot `+0x10` with `"Apple Inc."`.
+  - `EfiOSInfo.efi` slot `+0x10` stores the OS vendor string; when it is exactly `"Apple Inc."`, EfiOSInfo pulses GUID `0DFD015E-...` by transient install/uninstall, causing PlatformInit to skip the GOP BootCamp handoff.
+  - Meaning: PlatformInit/GOP BootCamp handoff is the non-Apple/generic OS handoff path, while Apple `boot.efi` deliberately suppresses it.
+- `boot.efi` `QueryBootDisplayState` calls CoreEG2's shared graphics protocol slot `+0x30`, now named `CoreEg2SharedGetBootDisplayState`. That CoreEG2 method only reports existing CoreEG2 display state (`display+524` mapped into a small code); it does not initialize the two-tile path.
+- Practical implication: do not spend kernel experiments trying to reproduce `boot.efi` UI/splash behavior. The higher-value firmware target remains the grouped `0xF00` lower backend state selection/refresh path and the mailbox byte that becomes GOP grouped-live `slot+25`.
+- Probe update: the EDK II probe shim v1.3 now logs the BootCamp support protocol and its adjacent GOP private replay fields read-only. Look for `GOP BootCamp Support` in `bootprobe.txt`; the high-value shape is `live=1`, `count=2`, endpoint masks including `0x100/0x200`, and output slot bytes including `00/01`. This should distinguish "protocol present but no paired replay state" from "paired state exists before the bootloader".
+- `Probe_results/new_21` captured that high-value shape on the diagnostics/OCLP-style path: `GOP_BOOTCAMP_SUPPORT` present, version `0x10000`, replay `live=1`, replay `count=2`, endpoint masks `0x100/0x200`, and endpoint output banks `00/01`. So for this path, the PlatformInit/GOP BootCamp handoff has the exact paired replay state it needs.
+- `Probe_results/new_22` captured the contrasting plain EFI shape: `GOP_BOOTCAMP_SUPPORT` is still present and valid, but GOP reports only `3840x2160`; replay is `live=0`, `count=0`; endpoint masks contain only `0x100`; output slots show only the current endpoint bank `00`, not the paired `00/01`. So the plain path does not fail because the BootCamp support protocol is missing; it fails earlier because CoreEG2/GOP never leaves the paired two-endpoint replay state live.
+- Resulting BootCamp question: the GOP BootCamp method is a consumer of live paired replay state, not the creator. The remaining question is who creates paired replay state for a real BootCamp/Windows boot: Apple BootPicker/AppleBootPolicy/graphics-connect before Windows starts, or the Windows driver later reconstructing the two-tile route itself.
 
 IDA annotations saved in the GOP IDB:
 
@@ -89,6 +148,28 @@ IDA annotations saved in the GOP IDB:
 - `sub_1BF30` -> `GopReadExtendedByteOpcode`
 - `sub_CF60` -> `GopReadDpTrainingStatusWindows`
 - `sub_E5F0` -> `GopReadExtended2210Bit3`
+- `sub_1750` -> `GopDriverBindingStart`
+- `sub_1B80` -> `GopDriverBindingStop`
+- `sub_BD00` -> `GopInitializeDisplayDeviceState`
+- `sub_2850` -> `GopInstallBootCampSupportProtocol`
+- `sub_28A0` -> `GopUninstallBootCampSupportProtocol`
+- `UNKNOWN_PROTOCOL_GUID_0` -> `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID`
+
+IDA annotations saved in the new PlatformInit IDB:
+
+- `sub_1170` -> `PlatformInitCallGopBootCampSupport`
+- `sub_150A` -> `PlatformInitExitBootServicesCallback`
+- `sub_13D1` -> `PlatformInitSetSkipBootCampSupportCall`
+- `byte_65D0` -> `PlatformInitSkipBootCampSupportCall`
+- `qword_71A0` -> `gBS`
+- `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID` named at `PlatformInit.efi+0x6090`
+
+IDA annotations saved in `boot.efi` and `EfiOSInfo.efi` IDBs:
+
+- `EFI_OS_INFO_PROTOCOL_GUID = C5C5DA95-7D5C-45E6-B2F1-3FD52BB10077`
+- `EFI_OS_INFO_APPLE_VENDOR_NOTIFY_GUID = 0DFD015E-A1BB-4E63-8372-89BD526DE956`
+- boot.efi comments at the EfiOSInfo locate / OSName / OSVendor / flags calls
+- EfiOSInfo comments on the protocol table, OSName slot, OSVendor slot, and transient Apple-vendor notify pulse
 
 Implication:
 

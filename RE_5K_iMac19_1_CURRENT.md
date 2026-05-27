@@ -52,6 +52,18 @@ The iMac19,1 internal 5K panel is treated as two real physical tile paths.
 
 The canonical tile order is primary/eDP left and secondary/DP right.
 
+### macOS IORegistry Cross-Map
+
+The public iMacPro1,1 IORegistry comparison in the OCLP/Khronokernel 5K UEFI article matches this model even though the machine uses Vega/Japura rather than the iMac19,1 Polaris path:
+
+- Good/supported path: `ATY,Japura@0` and `ATY,Japura@1` are both attached to the internal 5K panel.
+- Unsupported/generic UEFI path: `ATY,Japura@0` remains the internal panel, while `ATY,Japura@1` becomes `Empty`.
+- The external Thunderbolt framebuffers remain DisplayPort entries in both cases, so the collapse is specifically the second internal tile route disappearing, not a global GPU/framebuffer failure.
+- The macOS connector-personality label `LVDS` / `0x2` should be read as Apple's internal-panel personality label here, not as proof that the physical transport is legacy LVDS. Our route model remains two embedded DP-family paths: primary `0x3114` and secondary `0x3113`.
+- This is the macOS-side analogue of our probe split: diagnostics/OCLP-style handoff has two replay endpoints (`0x100` and `0x200`), while plain EFI has only the primary endpoint (`0x100`) live.
+
+The same article's iMac20,x note is also consistent with our scope boundary. iMac20,x/Navi can use DSC for a single-stream 5K internal path; pre-2020 5K iMacs and iMacPro1,1 need the dual-stream/two-framebuffer model. Do not use iMac20,x as the implementation model for iMac19,1 cold-boot enablement.
+
 ## Magic Number Registry
 
 Use these names before treating the values as unexplained magic:
@@ -118,6 +130,9 @@ Current firmware-side model:
 - The GOP also publishes `APPLE_GOP_DEVICE_PROTOCOL_GUID = 53CFEB0D-9B9E-4D0A-90B6-024A79906A58`; CoreEG2 has a driver binding for this protocol and stores the opened GOP device interface in its device node.
 - GOP installs the device protocol first, then the per-connector `CF611019-...` protocol and the framebuffer/root-display `F977B8AE-...` protocol. CoreEG2 waits until both expected child counts are present before running `CoreEg2ComplexDisplayInit`.
 - CoreEG2's successful paired path builds a 384-byte complex-display replay record and calls GOP device-protocol slot `+0x40`, identified as `GopReplaySavedDisplayConfiguration`. Cleanup/failure calls the same slot with `NULL`.
+- CoreEG2's generic restore path is separate from the complex-display replay path. It reads a per-device-path `SavedConfig` blob through `qword_E668` and then calls GOP device-protocol slot `+0x38`, identified as `GopApplySavedDisplayConfiguration`.
+- Provider naming correction from the 2026-05-20 IDA pass: `qword_E668` is the Device Path Property Database provider (`91BD12FE-F6C3-44FB-A5B7-5122AB303AE0`), while `qword_E660` is the Platform Info Database provider (`AC5E4829-A8FD-440B-AF33-9FFE013B12D8`).
+- `GopApplySavedDisplayConfiguration` copies the `SavedConfig` blob into GOP state/properties, probes connector-record caches through CoreEG2's shared graphics protocol if needed, then builds the GOP display-connect mask. For an internal DP route, masks in `0xF00` classify as connector type `11`.
 - That 384-byte replay record is now decoded enough to model the successful 5K handoff:
   - header at `record+0x000`: version `0x10000`, endpoint count `2`, endpoint pointer `record+0x120`, global-timing pointer `record+0x018`
   - global/logical timing at `record+0x018`: version `0x10001`, normal logical mode `5120x2880`, pixel-clock-ish value `938250000`
@@ -136,7 +151,8 @@ Current CoreEG2/GOP details that still matter:
 
 - CoreEG2 reads platform display flags into `dword_E670` using provider key GUID `1823A1A6-0EAF-4F3A-93D3-BF61F5EEFA0D`.
 - `dword_E670 & 1` gates the complex paired-display path before CoreEG2 tries the second/tiled connector path.
-- That provider read is through protocol `AC5E4829-A8FD-440B-AF33-9FFE013B12D8`, published by `ApplePlatformInfoDatabaseDxe.efi`; the misleading old CoreEG2 callback label was corrected in IDA to `CoreEg2RegisterPlatformInfoDatabaseProvider`.
+- That provider read is through `qword_E660`, the Platform Info Database protocol `AC5E4829-A8FD-440B-AF33-9FFE013B12D8`, published by `ApplePlatformInfoDatabaseDxe.efi`; the misleading old CoreEG2 callback label was corrected in IDA to `CoreEg2RegisterPlatformInfoDatabaseProvider`.
+- `SavedConfig`, `ComplexDisplaySetup`, AUX power, backlight/gamma, and failure records use `qword_E668`, the Device Path Property Database provider. Do not confuse this property provider with the `dword_E670` platform-policy provider.
 - The raw platform database maps selector `1823A1A6-...` to `j139 -> 5` and `j138 -> 1`; the same database maps `j139` to `iMac19,2` and `j138` to `iMac19,1`.
 - Raw firmware recheck: the selector GUID byte pattern is not present in the PE32 module set. It appears in the platform-info raw freeform file `5E7BE016-33CF-2D42-8758-C69FA5CDBB2F`, raw section offset `0x78`, whose value block at `0x7A0` contains exactly the `j139 = 5` and `j138 = 1` rows. The AC5E provider GUID appears in many PE modules because it is the database service protocol; the selector value itself is static platform database data.
 - Therefore, for the target `iMac19,1`, the best current evidence is `dword_E670 = 1`: bit0 should be set. Treat "plain boot has bit0 clear" as unproven and probably wrong unless a direct firmware trace/log proves it.
@@ -145,22 +161,124 @@ Current CoreEG2/GOP details that still matter:
 - `CoreEG2`'s paired-root success path correlates with that grouped subtype.
 - `CoreEG2` reaches GOP's `GopGraphicsConnectorBackendDispatchOpcode` for full-opcode connector backend operations.
 - GOP backend mode `a4 == 1` preserves full opcodes up to `0xFFFFF`; CoreEG2 decimal `1265` is therefore sent as full `0x4F1`, not truncated to `0xF1`.
+- Selector `5` clarification: CoreEG2 uses selector/opcode `5` as a one-byte status gate and only checks `(reply[0] & 6) == 2`. The later root class byte comes from the opcode/window `0` 16-byte classification block; `display+0x12C` is the first byte of that block and is accepted in the `0x10..0x14` range.
+- GOP grouped-live clarification: for grouped/internal mask `0xF00`, GOP marks the grouped-live latch from the grouped state slot byte `+25`. That latch upgrades outgoing grouped packet subtype `19 -> 20` and is also required for special grouped custom-rate validation.
+- 2026-05-20 grouped-slot source clarification: no GOP C-code writer for grouped state-slot byte `+25` has been found. `GopRefreshConnectorStateSlotFromExtendedWindows` reads extended opcode/window `0x000`, length `16`, into `slot+12..slot+27`; therefore `slot+25` is byte `13` returned by the lower connector mailbox after the grouped `0xF00` backend state is selected.
+- The grouped-live byte is sampled only on refresh paths. The known refresh callers are:
+  - `GopPrepareDpTrainingStateForSelectedMask`, reached from CoreEG2 backend `+0x28` training/apply calls.
+  - `GopTrainDetectedDpOutputByMask` and `GopTrainConnectorMaskWithDpTrainingLoop`, reached during detection/training.
+  - `GopValidateAndRefreshConnectorStateSlot`, reached during connector-record cache population.
+- Connector-record cache population probes ordinary DP-family masks (`0x100..0x400`) and does not directly populate the grouped `0xF00` state slot. Grouped `0xF00` becomes active later when saved state or CoreEG2 training selects the grouped/internal family.
+- `GopSelectConnectorMaskFromSavedState` is a framebuffer-protocol-table callback that copies a saved connector field, then masks it by saved mode type. Saved mode type `0xB` keeps only `0xF00`, so a valid Apple saved display state can intentionally route GOP into the grouped internal DP family. This still does not by itself prove grouped-live; the lower mailbox byte still has to become nonzero.
 - GOP's extended opcode transport is also used for normal DP DPCD training addresses (`0x100`, `0x101`, `0x102`, `0x103`, `0x107`, `0x108`) and training-status readback (`0x202`).
 - GOP has an optional extended `0x10A` write path gated by internal Apple/panel flags, which reinforces the current secondary-route ASSR/panel-policy direction.
 - CoreEG2's own training-status checker reads DPCD `0x202`, length `2`, through the same backend transfer and expects `0x77/0x77` for four lanes, `0x77` for two lanes, or `0x07` for one lane.
 - GOP connector id `1` maps to backend mask `0x100` / record-cache index `4`; connector id `2` maps to backend mask `0x200` / record-cache index `3`. CoreEG2's sibling rule is `root connector id + 1`, so this is the firmware-side root/sibling pair.
+- 2026-05-20 focused collapse-fork correction: CoreEG2's ordinary root/sibling complex-display path does not start by selecting grouped `0xF00`. The GOP connector object for connector id `1` has supported mask `0x120`, which dispatches as `0x100`; connector id `2` has supported mask `0x220`, which dispatches as `0x200`. Grouped `0xF00` is still real for saved-state/grouped training paths, but the immediate 5K-vs-fallback fork is whether the individual sibling `0x200` connector record becomes valid after the root-side `0x4F1 = 1` pulse.
+- CoreEG2 connector-record fetch details: `CoreEg2FetchConnectorRecordSet(connector, 1)` first writes extended opcode `0x600 = 1`, polls `0x600` until `(status & 3) == 1`, then reads paged opcode `0xA0` into 128-byte record pages. GOP's dispatch path for `0xA0` fills the selected per-index cache and marks it valid; if the paged read returns no data, CoreEG2 sees no connector record for that root or sibling.
+- GOP has a lower readiness gate before that `0xA0` read: `GopGraphicsConnectorBackendDispatchOpcode` calls `GopWaitForConnectorMaskReady(state, connector_supported_mask)`. For the iMac pair, root connector id `1` has supported mask `0x120` and waits on MMIO `0x1223C` bit `0x100`; sibling connector id `2` has supported mask `0x220` and waits on MMIO `0x1223C` bit `0x00000001`. Both masks carry bit `0x20`, so GOP polls for up to about `210 ms` before giving up. This is now the earliest concrete lower-level gate for the sibling `0x200` record becoming readable.
+- GOP immediate search found `0x1223C` only in the readiness/transaction code, with no GOP C-side writer. Current interpretation: the readiness bits are lower hardware/mailbox status produced by the selected connector bank/panel/TCON state, not a software flag that BootPicker or AppleBds directly stores.
+- CoreEG2 has a root pre-pass that can write `0x4F1 = 0` if the root connector record already looks like the Apple internal-panel record, then it refetches the root before creating the display object. The actual second-tile enable pulse remains the later `0x4F1 = 1` in `SetupSecondConIntAppleCD`.
+- CoreEG2's display-object destroy path also writes `0x4F1 = 0` when a complex-display block exists and the cached root record still has the Apple internal-panel signature. That is cleanup/unlatch behavior, not a second enable path.
+- After the sibling `0x200` record passes identity checks, CoreEG2 refetches the root `0x100` record and requires the root to still match the same Apple internal-panel identity. Therefore the collapse can happen in three concrete places after the platform bit: no sibling connector object, no/invalid sibling `0xA0` record after `0x4F1 = 1`, or root no longer validates after sibling validation.
 - CoreEG2's final paired-display decision still depends on live connector-record validation after `0x4F1 = 1`: sibling record bytes `+8/+9 == 0x0610`, byte `+0x0B == 0xAE`, and `(flags at +0x0A & 3) == 2`.
 - The final firmware-side 5K commit point is not OCLP code replacing CoreEG2; it is CoreEG2 reaching `GopReplaySavedDisplayConfiguration(record)` during DXE driver-binding connect.
 - `display + 0x25C` / `display + 604` is a key live flag/gate for whether complex-display data is consumed later.
 - `CoreEG2ConfigureAndActivateDisplayPipeline` is a hard consumer of the success-side complex-display record.
 - The strongest static boundary reached was that selector/class bytes come from raw lower-transport results.
+- 2026-05-20 `boot.efi` pass: `boot.efi` is now mostly a negative/directing result for 5K init. It does connect/open/query preboot graphics state, but it does not contain the CoreEG2/GOP DPCD/tile operations (`0x4F1`, `0x202`, grouped `0xF00` training, etc.).
+- `ConnectGraphicsDevices` locates Apple graphics-connect protocol `8ECE08D8-A6D4-430B-A7B0-2DF318E7884A`, calls slot `+0x18` for `ConnectAll` and slot `+0x08` for `ConnectDisplay`, and then reads Apple NVRAM variable `gfx-saved-config-restore-status`. In this IDB that variable is only referenced here, so `boot.efi` appears to consume/report restore status rather than construct the saved display config blob.
+- Binary search across `RE_Files/FirmwarePE32_All` finds the `8ECE08D8-...` graphics-connect GUID in `AppleBds.efi` and `SlingShot.efi`, not in CoreEG2/GOP. `AppleBds.efi` also contains strings `START:ConnectGfxDevs`, `START:ConnectController`, `END:ConnectController`, `END:ConnectGfxDevs`, and `CoreEG2`. Local disassembly shows the published AppleBds protocol table has slot `+0x08` at `AppleBds.efi+0x11159`, which calls a `ConnectGfxDevs`-looking routine at `+0x712F`; that routine eventually calls UEFI `BootServices->ConnectController(..., Recursive=TRUE)` for selected graphics handles. This makes Apple BDS / boot-manager connection order the stronger suspect for the OCLP/plain difference.
+- 2026-05-20 `AppleBds.efi` IDA pass:
+  - `AppleBds.efi+0x1210` installs `APPLE_BDS_GRAPHICS_CONNECT_PROTOCOL_GUID = 8ECE08D8-A6D4-430B-A7B0-2DF318E7884A` with interface table `AppleBdsGraphicsConnectProtocol` at `0x21A30`.
+  - `AppleBdsGraphicsConnectProtocol+0x08` is now named `AppleBdsGraphicsConnectDisplaySlot`; this is the slot `boot.efi` labels `ConnectDisplay`.
+  - `AppleBdsGraphicsConnectProtocol+0x18` is now named `AppleBdsGraphicsConnectAllSlot`; this is the slot `boot.efi` labels `ConnectAll`.
+  - `AppleBdsGraphicsConnectDisplaySlot` forwards to `AppleBdsConnectGfxDevsAndBootUiPath(0, 0)`.
+  - The first display-relevant phase of `AppleBdsConnectGfxDevsAndBootUiPath` calls `LocateHandleBuffer(ByProtocol, EFI_PCI_IO_PROTOCOL_GUID)`, reads PCI config space through `EFI_PCI_IO.Pci.Read(width=Uint32, offset=0, count=16)`, and filters for PCI base class `0x03` display controllers.
+  - It creates candidate records containing the PCI controller handle and a priority byte. The priority is `1` when the read PCI config data contains Apple vendor/subsystem value `0x106B`, otherwise `2`.
+  - The `START:ConnectGfxDevs` loop only enters the `START:ConnectController` path for priority-`1` records first; the call is `BootServices->ConnectController(controller, NULL, NULL, TRUE)`.
+  - After successful connect, AppleBds enumerates GOP handles and matches their device path back to the same PCI controller. This confirms the recursive connect is expected to produce/refresh graphics output handles for that controller.
+  - 2026-05-20 13339 MCP recheck: `AppleBdsBootManagerLoop` calls `AppleBdsConnectAllDispatchLoop` at multiple boot-manager/retry/selected-entry sites (`0x45CD`, `0x482A`, `0x4834`, `0x509F`, `0x51E5`, `0x5748`, `0x57FA`). `ConnectAll` immediately runs `AppleBdsConnectGfxDevsAndBootUiPath(0, 0)`. This strengthens the current model that Apple-mediated boots can perturb graphics connection order by BDS-side recursive graphics reconnects before `LoadImage`/`StartImage`, while BootPicker itself only classifies/labels Windows entries.
+  - Correction/nuance from the same pass: `ConnectAll` only calls `ConnectGfxDevs` when `byte_2239C != 1`. `ConnectGfxDevs` sets `byte_2239C = 1` early, so later `ConnectAll` calls usually run `sub_DE3B` plus `sub_DEB4` instead. `sub_DE3B` refreshes console device-path variables (`ConOut`, `ConIn`, `ErrOut`); `sub_DEB4` does a broad `LocateHandleBuffer(AllHandles)` loop and calls `ConnectController(handle, NULL, NULL, TRUE)` for every handle. So AppleBds can perturb graphics either through the dedicated Apple display-controller pass or through broad recursive connect, but it is not a simple unconditional "run 5K init now" switch.
+  - `AppleBdsLoadAndStartBootOption` performs `LoadImage`/`StartImage` without a direct call to `ConnectGfxDevs`; BootManagerLoop's `ConnectAll` calls are mostly earlier/fallback/retry paths around boot-option enumeration. This means AppleBds static RE alone probably cannot prove the OCLP/plain difference. We need to observe whether the final pre-Linux/OCLP path invokes the graphics-connect protocol or broad recursive connect after the plain path has already failed.
+  - Comments were added and saved in the AppleBds IDB at the `ConnectGfxDevs` entry, its `START:ConnectController` log site, and the BootManagerLoop `ConnectAll` call sites so this does not get rediscovered as a BootCamp string branch.
+- 2026-05-20 `AppleBds.efi` Apple-vs-generic boot classification pass:
+  - No explicit `BootCamp`, `Windows`, or `Microsoft` string was found in the current AppleBds string table. The boot split appears to be metadata/protocol based, not a literal BootCamp-name branch.
+  - `AppleBdsEvaluateExtendedBootPolicy` (`0x1C153`) resolves the selected boot device path to `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID` through `AppleBdsResolveSimpleFsAndPath` (`0x1B9B2`) and then calls `AppleBdsGetAppleBootVolumeIdentity` (`0x1BBCE`).
+  - `AppleBdsGetAppleBootVolumeIdentity` first probes root-file `GetInfo` GUID `900C7693-8C14-58BA-B44E-974515D27C78`; if present it copies a 16-byte Apple volume identity and sets the high Apple-identity output flag.
+  - If that is absent, it probes root-file `GetInfo` GUID `FA99420C-88F1-11E7-95F6-B8E8562CBAFA`; if that fails too, it falls back to `APPLE_PARTITION_INFO_PROTOCOL_GUID = 68425EE5-1C43-4BAA-84F7-9AA8A4D8E11E`.
+  - The Apple partition-info fallback accepts Apple partition type/name evidence: `Apple_Boot`, `Apple_HFS`, `Apple_HFSX`, `Apple_Recovery`, or matching Apple partition type GUID encodings. Accepted fallback paths set the low Apple-identity output flag.
+  - `AppleBdsEvaluateExtendedBootPolicy` later tests the combined Apple-identity flags. If neither Apple volume metadata nor Apple partition evidence was found, it forces result type `1`, the normal generic boot path. If Apple identity exists, it preserves the richer Apple EFBS/multiboot result and may set Apple failed-boot variables, recovery, boot-picker, or bridgeOS handoff state.
+  - `AppleBdsBootManagerLoop` (`0x3FE1`) and `AppleBdsLoadAndStartBootOption` (`0xBA39`) use `APPLE_BOOT_POLICY_PROTOCOL_GUID = 62257758-350C-4D0A-B0BD-F6BE2E1E272C` to synthesize real boot file paths for media-only / Apple-policy boot entries before `LoadImage`. Generic EFI entries with explicit file paths do not need this AppleBootPolicy synthesis.
+  - Current interpretation: firmware probably does not "know BootCamp" as a positive string in this path. It recognizes Apple-blessed volumes positively; BootCamp/systemd-boot/plain EFI are the negative case that lacks AppleBootPolicy/ApplePartitionInfo/root-GetInfo identity and therefore follows generic EFI boot handling.
+- 2026-05-20 AppleBds BootCamp false-lead cleanup:
+  - The tempting `#[BDS|BC:SS]` log in AppleBds is not BootCamp. IDA context shows `BC` here is boot-chime/startup-sound handling: the function reads `StartupSound`, `StartupMute`, `MuteNextBoot`, `PanicMedic`, and `CriticalBattery`, then logs a `BootChimeOnLastBoot` data-hub record.
+  - IDA comments were added at `AppleBds.efi+0xFA00`, `+0x1D52B`, `+0x2AF9`, and `+0x2ACC` so this path does not get rediscovered as BootCamp display logic.
+  - `BootPicker.efi` does contain user-facing strings such as `Windows`, `WININSTALL`, and `Efi Boot`; unlike AppleBds, this remains a live RE target for how Apple's boot picker classifies or launches Windows/BootCamp entries before the OS loader starts.
+- Important correction/nuance: this Apple-volume classifier is not sufficient to explain OCLP. OCLP/OpenCore can boot from a generic EFI partition and still perturb the graphics state. OpenCore has UEFI graphics/driver connection options such as `ConnectDrivers`, `ReconnectGraphicsOnConnect`, `ProvideConsoleGop`, `GopPassThrough`, and `DirectGopRendering`; upstream docs describe `ReconnectGraphicsOnConnect` as disconnecting/reconnecting graphics drivers during driver connection and requiring `ConnectDrivers`. So OCLP can plausibly trigger the AppleBds/CoreEG2/GOP graphics-connect path without being classified as an Apple partition.
+- The RE consequence is that we should keep two candidate explanations separate:
+  - Apple/macOS boot target classification: AppleBds positively recognizes Apple-blessed volumes through BootPolicy/ApplePartitionInfo/root-GetInfo metadata.
+  - OCLP preboot graphics trigger: OpenCore may explicitly reconnect/provide GOP/console graphics and thereby cause CoreEG2/GOP driver-binding or saved-state replay to run in the good order.
+- 2026-05-20 OCLP PR #777 / Khronokernel article checkpoint:
+  - The public OCLP 5K workaround is explicitly a Hardware Diagnostics disguise, not a normal OpenCore graphics setting. The described chain is Apple `boot.efi` -> `/System/Library/CoreServices/.diagnostics/diags.efi` -> first hardware driver `.../.diagnostics/Drivers/HardwareDrivers/Product.efi` -> OpenCore/real loader.
+  - The article states Apple firmware renders Boot Picker in 5120x2880 using the dual-DP stream, but if a non-Apple UEFI entry is loaded it forces compatibility mode: single DP stream, 3840x2160, product-id style `ae01` instead of full `ae03`.
+  - It also states Apple appears to check the signature of every loaded UEFI application, so simply renaming a third-party loader to `boot.efi` is insufficient. The diagnostics path works because Hardware Diagnostics loads product drivers through an Apple-controlled/encrypted-file-buffer path, letting the loader appear as a native Apple diagnostics driver.
+  - This should steer RE away from "OpenCore setting X sets 5K" and toward "which Apple firmware image-load / diagnostics product-driver path avoids or delays the unsupported-entry collapse until after CoreEG2/GOP paired replay is live."
+  - Open question to resolve with RE: where is the unsupported-image collapse implemented? Candidates are AppleBds/BootPolicy/boot.efi diagnostics-load code that classifies image signatures and then calls into graphics-connect/CoreEG2/GOP cleanup, versus a lower Apple diagnostics policy path that prevents the collapse from being requested in the first place.
+- 2026-05-20 BootCamp firmware RE checkpoint:
+  - The Polaris GOP publishes a separate private BootCamp support protocol, `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID = A3249A94-CB66-43FC-92F3-8BA1889FD6C7`.
+  - GOP driver-binding start now installs this protocol after the GOP device, connector, and framebuffer protocol stack is present. The interface is embedded at GOP display-state `+0x320`; method slot `+0x08` is `GopBootCampPrepareLinkState`.
+  - `GopBootCampPrepareLinkState(a1, a2, a3)` treats `a3 == 1` as a no-op success. For `a2 == 1 || a2 == 2`, it calls `GopApplyBootCampLinkRegisterSequence(state, 0xF4000000)`.
+  - That helper is GPU MMIO handoff plumbing, not a connector-mailbox/DPCD transaction. It toggles CRTC blank-control bit `0x100` on either the current endpoint or all GOP replay endpoints, writes global registers `0x2024` and `0x2C04`, pokes DCP primary-surface address/high registers, then restores the CRTC blank bit.
+  - The sequence uses GOP multi-display state (`state+2216`, `state+2212`, `state+2210`, endpoint bank bytes at `state+2276+i`), so if saved/replayed dual-tile state is already active, the BootCamp hook can touch both tile endpoints.
+  - Static writer search now makes that dependency sharper: `state+2216` and `state+2212` are set by `GopReplaySavedDisplayConfiguration(non-NULL)` and cleared by the replay cleanup/`NULL` path. The BootCamp method consumes that replay state; it does not appear to create it.
+  - GOP output-bank mapping is also decoded: backend mask `0x100` maps to output bank byte `0`, mask `0x200` maps to bank byte `1`, while grouped mask `0xF00` maps to bank byte `0`. A real two-tile BootCamp handoff therefore needs replay endpoints that resolve to the split `0x100/0x200` connector objects, not only one grouped `0xF00` endpoint.
+  - PlatformInit caller side is now confirmed in `PlatformInitCallGopBootCampSupport` (`PlatformInit.efi+0x1170`). PlatformInit registers this routine as an `EVT_SIGNAL_EXIT_BOOT_SERVICES` callback from its module entry path, so this is an OS-handoff-time hook.
+  - That callback calls `LocateHandleBuffer(ByProtocol, GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID, ...)`, walks `ProtocolsPerHandle`, opens the exact protocol with `OpenProtocol(..., EFI_OPEN_PROTOCOL_GET_PROTOCOL)`, checks interface version `0x10000`, then calls method slot `+0x08` as `(iface, 1, 2, 0, 0, 0)`.
+  - Therefore the GOP sees `a2 == 1` and `a3 == 2`: this definitely takes the real `GopApplyBootCampLinkRegisterSequence(..., 0xF4000000)` path, not the `a3 == 1` no-op path.
+  - One PlatformInit gate remains: `PlatformInitSkipBootCampSupportCall` suppresses this callback when set. The only writer found so far is `PlatformInitSetSkipBootCampSupportCall` (`PlatformInit.efi+0x13D1`), a protocol-notify callback for GUID `0DFD015E-A1BB-4E63-8372-89BD526DE956`.
+  - The source of that skip notify is now clear: `boot.efi` locates `EFI_OS_INFO_PROTOCOL_GUID = C5C5DA95-7D5C-45E6-B2F1-3FD52BB10077`, calls slot `+0x08` with `"macOS 11.0"`, then slot `+0x10` with `"Apple Inc."`.
+  - In `EfiOSInfo.efi`, slot `+0x10` stores the OS vendor string. When the stored vendor is exactly `"Apple Inc."`, EfiOSInfo transiently installs/uninstalls GUID `0DFD015E-...`; this pulse wakes PlatformInit's notify callback and sets `PlatformInitSkipBootCampSupportCall = 1`.
+  - Therefore the PlatformInit/GOP BootCamp handoff is the non-Apple/generic OS handoff path. Apple `boot.efi` deliberately suppresses it by declaring OS vendor `"Apple Inc."`.
+  - Historical driver checkpoint: the first public Boot Camp/Windows path that enabled full 5K on the 2014 5K iMac appears to be the Apple Software Update "Boot Camp Update 6.0 for iMac 5K" from November 2015, with AMD display driver `15.201.2001.0` dated `2015-10-05`, package string `15.201.2001-15005a-295390C`, `ProductVersion 6.0.6237`, and INF `C0295241.inf`. The older Boot Camp 6 package seen in reports used AMD driver `15.200.1060.0` dated `2015-07-15`, `ProductVersion 6.0.6133`, and did not provide 5K for the affected systems.
+  - RE implication: `15.200.1060.0` -> `15.201.2001.0` is a high-value old/new Windows driver diff target because it is the smallest known public transition from 4K-limited Boot Camp behavior to Windows 5K behavior.
+  - `AppleBcUpdate6.0.6171` / Apple product `031-55711` is a misleading bridge candidate. Public posts label it as Boot Camp `6.0.6171` from `2016-04-01`, but local inspection of the Apple CDN `AppleBcUpdate.exe` shows `Bootcamp.xml` reports BuildNumber/ProductVersion `6.0.6136` and the AMD display payload is still `C0186304.inf` / `DriverVer=07/15/2015,15.200.1060.0000`, not `C0295241.inf`. Therefore it is not the 5K-enabling AMD branch and should be treated as another old-driver reference point, not the target diff endpoint.
+  - Local BootCamp diff checkpoint: the unpacked `BootCamp/4K/6.0.6136` tree contains AMD display INF `C0186304.inf` and branch subdir `B186909`; the unpacked `BootCamp/5K/BootCamp6.0 6237` tree contains AMD display INF `C0295241.inf` and branch subdir `B295223`. The 5K package targets Apple Tonga `DEV_6920` / subsystems `014C106B` and `014D106B` (`R9 M395/M395X`), while the older 4K package targets Apple Tonga `DEV_6938` / subsystem `013A106B` (`R9 M295X`).
+  - Apple display-package check: both trees include `AppleDisplayInstaller64.exe`, but its embedded `aaplmonf64.inf` is the same generic Apple HID/display filter package (`DriverVer=01/23/2009,3.0.0.0`), not a 5K EDID or tile-enable payload. This makes the AMD display driver the useful diff target, not the Apple display installer.
+  - AMD display-driver diff checkpoint: extracted local binaries are `tmp_bc_amd_compare/4K_atikmdag.sys` (`21622272` bytes, SHA256 prefix `B7FD68E6E3AA4605`) and `tmp_bc_amd_compare/5K_atikmdag.sys` (`21519872` bytes, SHA256 prefix `3C63756B65789549`), plus `atikmpag.sys` (`665088` -> `484864` bytes). Both `atikmdag.sys` binaries already contain generic strings for `DalEnable5kTiledMode`, `DalEnableTiledDisplay`, `DPCD`, `AUX`, `EDID`, and MST/SST handling, so the 5K change is likely a code/data behavior change behind existing AMD DAL paths, not a newly named feature. The newer binary adds visible strings such as `Forced EDID read.` and `DalSendDPMSNotification`, but no obvious Apple-only 5K opcode string.
+  - Current interpretation: BootCamp firmware support is real and active for non-Apple OS handoff when the GOP protocol is present, but this GOP method looks like scanout/link handoff after display state exists. It does not by itself explain how the panel becomes grouped-live/tile-paired; that still depends on the earlier CoreEG2/GOP grouped `0xF00` state and whether the GOP BootCamp protocol is present by handoff time.
+  - New probe implication: `Probe_results/new_22` proves the GOP BootCamp protocol is present even in the plain generic path, but replay is `live=0/count=0`. So the missing BootCamp-vs-plain answer is not "who publishes GOP_BOOTCAMP_SUPPORT"; it is who makes CoreEG2/GOP reach paired replay state before the BootCamp handoff consumes it.
+  - Open BootCamp question: if real Windows BootCamp cold-boots at 5K, the paired state is likely created either by Apple BootPicker/AppleBootPolicy/graphics-connect ordering before `bootmgfw.efi`, or later by the Windows driver reconstructing the second tile through its own object-table/AUX route. Current firmware RE favors investigating BootPicker next.
+- `QueryBootDisplayState` opens GOP/fallback framebuffer state, then locates `APPLE_SHARED_GRAPHICS_PROTOCOL_GUID = 63FAECF2-E7EE-4CB9-8A0C-11CE5E89E33C` and calls protocol slot `+0x30`. In CoreEG2 this slot is now named `CoreEg2SharedGetBootDisplayState`; it only maps current CoreEG2 display object state byte/dword `display+0x20C` (`+524`) into a small boot display-state code. It does not perform paired-display initialization.
+- `BootGraphicsOpenAndDrawSplashPreview` is the renamed boot.efi wrapper that may call `ConnectGraphicsDevices(0, 1)`, `OpenBootGraphics`, `QueryBootDisplayState`, and `DrawBootGraphics`; current evidence says this is splash/UI plumbing, not the 5K tile bring-up path.
+- Current interpretation: the OCLP/diagnostics difference is still likely in the Apple firmware connection/probe order or saved-state preservation before Linux, not in `boot.efi` directly programming the panel. The next narrow RE target is now the CoreEG2 sibling-record fork: why connector id `2` / backend mask `0x200` / record-cache index `3` returns a valid Apple internal-panel `0xA0` record after the root-side `0x4F1 = 1` pulse on the good path, but not on the plain path. The grouped `0xF00` state remains relevant for saved-state/grouped consumers, but it is no longer the first-order collapse point.
 
 What firmware RE does not prove:
 
 - It does not prove Linux needs Apple EFI runtime calls after ExitBootServices.
 - It does not prove `1265` is a magical mailbox opcode that Linux must replay.
 - It does not prove a one-sink fake 5K abstraction is the hardware model.
+- It does not prove the PlatformInit/GOP BootCamp handoff creates the 5K grouped-live state from scratch; current evidence says it prepares/hands off scanout/link state once GOP display state already exists.
 - It does not prove the OCLP/plain difference is `dword_E670` bit0. The stronger current suspect is later CoreEG2/GOP sibling connector discovery/validation after the root-side `0x4F1` latch sequence.
+
+Next dynamic check added on 2026-05-20:
+
+- The EDK II probe shim now logs `GOP_BOOTCAMP_SUPPORT_PROTOCOL_GUID`, `EFI_OS_INFO_PROTOCOL_GUID`, and the transient Apple-vendor notify GUID counts.
+- Probe v1.3 also reads the GOP BootCamp support interface at `iface`, validates the GOP state signature at `iface - 0x320`, and logs the private replay fields `state+0x8A2`, `state+0x8A4`, `state+0x8A8`, endpoint masks at `state+0x8B0`, and output slot bytes at `state+0x8E0..0x8E7`.
+- This is still read-only. The useful signal is whether a preboot path shows `live=1`, `count=2`, masks including `0x100/0x200`, and output slots including `00/01` before Linux starts.
+- `Probe_results/new_21` result: probe v1.3 ran successfully. GOP BootCamp support is present (`count=1`), interface version is `0x10000`, GOP state signature is `0x30315652`, replay state is live with `count=2`, endpoint masks are `0x100` and `0x200`, and output slot bytes include `00 01` at the endpoint-bank positions. This proves the diagnostics/OCLP-style path has exactly the split two-endpoint GOP replay state that PlatformInit's non-Apple BootCamp handoff consumes.
+- `Probe_results/new_22` plain EFI result: probe v1.3 also ran from the generic removable path. GOP BootCamp support is still present and valid, but GOP mode is only `3840x2160`, replay state is not live (`count=0`, `live=0`), endpoint masks contain only `0x100`, and output slot bytes show only bank `00` for the current endpoint (`... 00 FF FF FF`) rather than `00/01`. This pins the OCLP/plain difference: plain EFI does publish the BootCamp support protocol, but it lacks the paired GOP replay state that would let the handoff operate on both tile endpoints.
+- Windows-starting-state checkpoint:
+  - We do not yet have a probe result launched through the real Windows Boot Manager / BootPicker path, so we cannot honestly claim that Windows starts from the exact same state as `new_22`.
+  - A lightweight static scan of `BootPicker.efi` found Windows-aware strings (`Windows`, `WININSTALL`, `Efi Boot`) and references to `APPLE_BOOT_POLICY` and `EFI_GRAPHICS_OUTPUT`, but no embedded references to `APPLE_BDS_GRAPHICS_CONNECT`, `GOP_BOOTCAMP_SUPPORT`, `EFI_OS_INFO`, `APPLE_SHARED_GRAPHICS`, `CoreEG2`, `DPCD`, `AUX`, or tiled-display strings.
+  - BootPicker RE with efiXplorer confirms the Windows strings are in boot-entry classification/UI paths:
+    - `BootPickerClassifyFsBootTarget` (`BootPicker.efi+0x3133`) probes Simple FS/Block IO, checks `\EFI\Microsoft\Boot\bootmgfw.efi`, and distinguishes `WININSTALL` media by reading the block device boot sector. It returns class codes only.
+    - `BootPickerClassifyHandleDeviceKind` (`BootPicker.efi+0x2ED2`) classifies an EFI handle by device path/protocols and keeps a `0x80000` Windows marker only when `BootPickerClassifyFsBootTarget` returns the normal Windows class.
+    - `BootPickerBuildChoiceUiEntry` (`BootPicker.efi+0x34F6`) builds the visible boot-choice entry; its `Windows`, `Efi Boot`, `Recovery HD`, and disk-label strings are labels/fallback names, not a display bring-up path.
+    - `BootPickerResolveConsoleGopForUi` (`BootPicker.efi+0x105D0`) reads `UIScale`, resolves a GOP with non-zero dimensions, and falls back to another GOP handle if ConsoleOut GOP is unusable. It does not train links, call CoreEG2, or create paired GOP replay state.
+  - IDA annotations were added for these routines and the key Windows/WININSTALL branches so we do not rediscover the same path.
+  - This strengthens the read that BootPicker itself does not directly perform the missing 5K/CoreEG2/GOP replay initialization, but it still does not disprove an indirect boot-policy, BDS, or connection-order effect before Windows starts.
+  - The decisive experiment is to launch the existing preboot probe from the exact Windows loader path (`\EFI\Microsoft\Boot\bootmgfw.efi` or the real Boot#### Windows Boot Manager entry). If that probe reports `live=1/count=2/0x100+0x200`, Windows receives the 5K-enabled firmware path. If it reports the `new_22` shape (`3840x2160`, `live=0/count=0`, only `0x100`), Windows starts from 4K fallback and the runtime driver rebuilds/revives 5K.
 
 ## Windows Driver RE Model
 
@@ -2967,3 +3085,2944 @@ Solution summary (the chain that closed Stage 1):
 Known minor issue (non-fatal, not blocking): one `atomic remove_fb failed with -22` plus a `WARNING` at `drm_framebuffer.c:1176` at t=138s — a framebuffer-cleanup splat; the display kept running normally for 127s+ afterward. Worth a follow-up pass but it does not affect the 5K result.
 
 Remaining work: Stage 2 (Apple-free plain boot — Linux discovering/constructing the real `0x3113` route without OCLP) is still open and unchanged. The non-fatal `remove_fb` WARN is a small cleanup candidate.
+
+## BootCamp AMD Driver RE Checkpoint: Forced EDID Refresh Delta
+
+IDA MCP mapping for the current Windows BootCamp comparison:
+
+- `mcp__ida_pro_mcp__`: old `4k_atikmdag.sys` from BootCamp `6.0.6136`, SHA256 `b7fd68e6e3aa4605c4f847423ddf0e4c7510bb451729ef68e5e81868c2127b96`.
+- `mcp__ida_pro_mcp_gop__`: newer `5k_atikmdag.sys` from BootCamp `6.0.6237`, SHA256 `3c63756b65789549abff1b38891e15f99d358178eca3f64365de4942d117971b`.
+
+Useful names/comments added in IDA:
+
+- Old driver:
+  - `0xb4db84` -> `DalEdidRefreshIfNeeded`
+  - `0xb4e53c` -> `DalReadEdidBlocks`
+  - `0xb4e9e0` -> `DalReadOneEdidBlock`
+  - table slot `0x13cdda8` commented as the old EDID refresh vtable/table slot.
+- New driver:
+  - `0xb63c34` -> `DalEdidRefreshIfNeededOrForced`
+  - `0xb64630` -> `DalReadEdidBlocks`
+  - `0xb64ad4` -> `DalReadOneEdidBlock`
+  - table slot `0x13dfc30` commented as the new forced-capable EDID refresh vtable/table slot.
+
+Observed delta:
+
+- The old and new EDID clusters are almost identical: same EDID read-status helper size, same EDID block-reader shape, same EDID error path (`EDID read error: %i. Skipping EDID query.`).
+- The newer 5K-capable driver adds a second `char` argument to the EDID refresh wrapper. When nonzero, it calls `DalReadEdidBlocks()` even if cached EDID flags are already set and logs `Forced EDID read.`.
+- A string-level old/new diff confirmed that `Forced EDID read.` is the only meaningful new display/EDID/tile-related string seen so far.
+- `DalEnable5kTiledMode` and `DalEnableTiledDisplay` are present in both drivers as registry/config-table strings, not direct code anchors.
+
+Current interpretation:
+
+- This does not yet prove that forced EDID refresh is the whole 5K enablement mechanism, but it is the cleanest real code delta found so far in the 5K-capable Windows driver.
+- It fits our Linux/OCLP observations: the Windows driver may not need Apple firmware to leave the panel fully alive if it has a path that forces a fresh EDID/tile identity query after boot instead of trusting stale/cached state.
+
+Indirect caller check:
+
+- Several existing enumeration/dispatch callsites pass `EDX=1` to a returned object's vtable slot `+0x60`:
+  - New driver: `0xaf32a`, `0xaf54b`, `0xd94d6`.
+  - Old driver: `0x7c51a`, `0x7c73b`, `0xa8ee6`.
+- Important correction: this is not yet proven to be the `DalEdidRefreshIfNeededOrForced` slot. Matching the slot offset alone is insufficient; one neighboring callsite slot shape does not fit the EDID table cleanly.
+- IDA comments at these callsites were corrected to mark them as unresolved candidate force-refresh patterns, not confirmed EDID dispatches.
+- The two main new-driver callsites (`0xaf280`, `0xaf4b0`) both acquire the target object through `sub_B49A0(..., 3)`. The old-driver equivalents (`0x7c470`, `0x7c6a0`) use matching `sub_81B50(..., 3)`. These lookup helpers call an object-manager vtable method at offset `+0x278` (`632`) with the type/id argument `3`, then the returned object is used for the `+0x60` forced-refresh call.
+- The higher caller `sub_AF3E0` is a generic display-enumeration path. It calls `sub_AF4B0` directly for one target, or for every enabled target when `a2 == -3`. This still looks like normal Windows display enumeration rather than a string-obvious BootCamp-only path.
+
+Next RE target:
+
+- Identify the object returned by `sub_B49A0(..., 3)` / old `sub_81B50(..., 3)` at those callsites and confirm it is the EDID/monitor object using the `0x13dfbd0...0x13dfc60` table.
+- Then walk the caller chain one layer up to determine whether this forced refresh is reached from normal Windows display enumeration, hotplug detect, tiled-display setup, or a BootCamp-specific startup path.
+
+Follow-up correction from the object-table check:
+
+- The only proven references to `DalEdidRefreshIfNeededOrForced` are the unwind/pdata entry and the method table slot `0x13dfc30`. No direct code caller and no direct data reference to the apparent table base `0x13dfbd0` has been found yet.
+- Therefore the strong conclusion is narrower than the first pass: the 5K-capable driver contains a real forced EDID refresh callee that the old driver lacks, but we have not yet proven which runtime path reaches it.
+- The generic enumeration path is still interesting because it acquires object type/id `3` and calls `+0x60` with `EDX=1`, but that may be a different object's `+0x60` method. Treat it as a lead, not evidence.
+- Current next target is the object manager implementation behind the `+0x278` call in `sub_B49A0`: find which concrete vtable is stored at the display-manager field `+0xA88`, then resolve what type/id `3` returns.
+
+Object-manager breadcrumbs:
+
+- `sub_AFE30` initializes the display-manager field `+0xA88`. The value comes from the driver context, not from a local constructor:
+  - `sub_9FDF0(this)` returns `this+0x180`.
+  - `?precision@ios_base@std@@QEBA_JXZ` at `0x1a2100` is just a small field accessor returning `*(ctx + 0x20)`.
+  - `sub_AF61F4()` returns `*(that + 8)`.
+  - The result is stored at `this+0xA88` and later used by `sub_B49A0`.
+- `sub_B49A0` itself is now best described as: per-display object lookup/acquire. It gets the per-display backend state through `sub_A5B60()` and `sub_A3BA60()`, then calls the `+0xA88` manager's method at vtable offset `+0x278` with `(backend + 0x28, type_id, 0)`.
+- A quick caller scan found no obvious `sub_AF61F4()` caller that immediately resolved the same `+0x278` object-manager method. The manager object appears to be supplied by the shared context, so the next useful target is the context/provider construction path rather than the display-manager enumeration wrapper.
+
+Confirmed forced-EDID caller path:
+
+- The earlier `+0x60` lead was the wrong slot. `DalEdidRefreshIfNeededOrForced()` subtracts `0x20` from `this`, which proves it is installed on the DP-sink secondary interface, not the primary interface.
+- New driver vtable:
+  - Secondary DP-sink vtable starts at `0x13dfbe8`.
+  - `0x13dfc30 = 0x13dfbe8 + 0x48` points to `DalEdidRefreshIfNeededOrForced()`.
+- Old driver vtable:
+  - Secondary DP-sink vtable starts at `0x13cdd60`.
+  - `0x13cdda8 = 0x13cdd60 + 0x48` points to `DalEdidRefreshIfNeeded()`.
+- So the real forced EDID dispatch slot is secondary-vtable `+0x48`.
+
+The runtime path is now identified in `DisplayCapabilityService`:
+
+- New driver names/comments added in IDA:
+  - `0xbbf7f8` -> `DisplayCapabilityService_ctor`
+  - `0xb6a5b8` -> `CreateDisplayCapabilityService`
+  - `0xbc1588` -> `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid`
+  - comment at `0xbc166c`: this call invokes downstream slot `+0x48` with `force=((capability_byte6 >> 1) & 1)`.
+- Old driver names/comments added in IDA:
+  - `0xbaa93c` -> `DisplayCapabilityService_ctor`
+  - `0xb54720` -> `CreateDisplayCapabilityService`
+  - `0xbac8ec` -> `DisplayCapabilityService_RefreshCapsNoForceArg`
+  - comment at `0xbac9ca`: old code calls the same downstream slot `+0x48`, but does not prepare/pass a force boolean.
+
+Important old/new diff:
+
+- New `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid()` reads a capability blob through its own vtable slot `+0x1e0`; that tail-calls a provider stored at service base `+0x68`.
+- It then computes the force flag from byte 6 bit 1 of that returned capability blob:
+  - assembly: `mov dl, [capability_byte6] ; shr dl, 1 ; and dl, 1 ; call [downstream_vtable+0x48]`
+  - decompiler: `force = (v13 & 2) != 0`.
+- The downstream object used for this call is service base `+0x48`. `DisplayCapabilityService_ctor()` stores the factory's `a7` argument there.
+- One construction path passes `a7 = 0`; the grouped/path-list path in `sub_B141C0()` passes `*(config + 0x20)` as `a7`. That is the next object to identify, because it is likely the DP-sink-like object whose EDID refresh gets forced in the 5K path.
+- Old `DisplayCapabilityService_RefreshCapsNoForceArg()` has the same broad shape, but only keeps the earlier capability bytes and calls downstream slot `+0x48` without setting `DL/RDX` from byte 6. Combined with the old DP-sink callee lacking the force branch, this is a concrete 5K-capable-driver behavior change.
+
+Current interpretation:
+
+- BootCamp 6.0.6237 likely does not contain an obvious Apple-only "enable 5K" routine. Instead, it adds a small but meaningful recovery mechanism: when `DisplayCapabilityService` sees a capability bit on the grouped/path-list object, it forces the downstream DP sink to re-read EDID over AUX instead of trusting cached state.
+- This fits the hypothesis that Windows can start from a less complete firmware handoff than OCLP/macOS and revive the tile identity by re-querying the sink. It does not yet prove the whole 5K path, but it is now a confirmed caller-to-callee chain rather than just a string/table diff.
+
+Next RE target:
+
+- Identify the service `a7` / config `+0x20` object in the grouped/path-list constructor path (`sub_B141C0`, especially the callers `sub_B149BC` and `sub_B14480`).
+- Determine what provides byte 6 bit 1 in the capability blob returned through service slot `+0x1e0` / provider slot `+0x30`.
+- If that bit corresponds to tiled/grouped internal DP capability, this becomes the best Windows-shaped model for a Linux implementation: force the secondary/tile sink EDID refresh only when the grouped path says it is needed, not as a blind global wake.
+
+Capability-bit source for forced EDID:
+
+- The `+0x1e0` call in `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid()` is through the service's secondary vtable (`0x13ef1d8 + 0x1e0 = 0x13ef3b8`), not the primary vtable.
+- New names/comments added in IDA:
+  - `0xbc0720` -> `DisplayCapabilityService_GetCapabilityMask8`
+  - `0xc321fc` -> `DisplayCapsProvider_GetCapabilityMask8`
+  - `0xc63d98` -> `MonitorCaps_GetCapabilityMask8`
+  - `0xc63dec` -> `MonitorCaps_RebuildFromEdidAndOverrideTable`
+  - `0xc64ccc` -> `MonitorCaps_SetCapabilityBit`
+  - `0xc649ec` -> `TranslateMonitorCapabilityCodeToBitIndex`
+  - `0xc63ad4` -> `MonitorCapsProvider_ctor`
+- Data flow:
+  - `DisplayCapabilityService_GetCapabilityMask8()` obtains an 8-byte monitor capability mask from service base `+0x50` (`secondary this +0x30`).
+  - `DisplayCapsProvider_GetCapabilityMask8()` forwards to a `MonitorCaps` object.
+  - `MonitorCaps_GetCapabilityMask8()` returns/copies the qword at `MonitorCaps +0x38`.
+  - `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid()` then uses byte 6 bit 1 of that qword as the `force` argument for downstream DP-sink slot `+0x48`.
+- The exact bit is now mapped:
+  - `TranslateMonitorCapabilityCodeToBitIndex(54)` returns internal bit index `56`.
+  - `MonitorCaps_SetCapabilityBit()` maps internal bit index `56` to `mask[6] |= 0x02`.
+  - `mask[6] & 0x02` is exactly the bit consumed as `force=1` for `DalEdidRefreshIfNeededOrForced()`.
+- Therefore the 5K-capable driver is not just "force EDID sometimes"; it forces EDID only when the monitor capability system marks bit index `56`. The unresolved question is the semantic name of raw capability code `54` / internal bit `56`.
+
+Next RE target, refined:
+
+- Find the monitor-specific override/capability table entry that emits raw code `54`, and identify which EDID/vendor/product path selects it.
+- If that table entry matches the iMac 5K internal panel, BootCamp's behavior becomes very clear: detect this panel through the monitor capability table, set bit 56, then force a DP-sink EDID refresh during DisplayCapabilityService refresh.
+- After that, compare with our Linux captured EDIDs to see whether the same identity can be recognized safely in-kernel without relying on Apple firmware/OCLP state.
+
+Static table result:
+
+- The newer 5K-capable `atikmdag.sys` contains a monitor capability table store built by `MonitorCapabilityTableStore_ctor` at `0xaf9540`.
+- That constructor installs:
+  - a small 5-entry table at `0x1416d60`, now named/commented in IDA as `MonitorCapabilityOverrideTable_5Entries`;
+  - the main 118-entry table at `0x1416db0`, now named/commented in IDA as `MonitorCapabilityOverrideTable_118Entries`.
+- The APP-panel force-EDID fragment starts at `0x1417490`, now named/commented in IDA as `ApplePanelForceEdidCapabilityEntries_code36`.
+- Entries are 16 bytes: `manufacturer_id`, `product_id`, `raw_capability_code`, `value`.
+- Entries found:
+  - `APP/AE01 -> raw 0x36, value 0`
+  - `APP/AE02 -> raw 0x36, value 0`
+  - `APP/AE0D -> raw 0x36, value 0`
+  - `APP/AE0E -> raw 0x36, value 0`
+  - `APP/AE05 -> raw 0x36, value 0`
+  - `APP/AE06 -> raw 0x36, value 0`
+  - `APP/AE09 -> raw 0x36, value 0`
+  - `APP/AE0A -> raw 0x36, value 0`
+- No matching APP/AE entries were found in the older 4K driver with the same scan.
+- No `APP/AE25` or `APP/AE26` raw-`0x36` entry was found in this BootCamp 6.0.6237 binary. That matters because our later Linux logs show iMac-panel IDs such as `AE25`/`AE26`; this BootCamp delta appears aimed at an older Apple 5K panel set, not necessarily the exact iMac19,1 panel table we later studied.
+- A broader plausible-table scan found the main `0x1416db0..0x1417550` run as the only meaningful monitor-capability table with APP entries. The apparent raw-`0x36` hits elsewhere are not APP/product override rows and look like unrelated small numeric tables.
+- `MonitorCapabilityTableStore_ctor` also wires in dynamic/config rows:
+  - `0xaf9a68` -> `LoadDalPanelPatchByIdEntries`, reading `DALPanelPatchByID` and converting entries into the same 16-byte row format.
+  - `0xaf9884` -> `LoadDalMonitorStereoSupportOverride`, reading `DALMonitorStereoSupport`.
+  - These explain how non-static rows can be added, but the APP raw-`0x36` rows discussed above are static in the 118-entry table.
+
+Interpretation of the BootCamp 6.0.6136 -> 6.0.6237 delta:
+
+- It is a two-part change:
+  - new static APP panel entries that produce raw capability `0x36`;
+  - new runtime code that maps raw `0x36` -> internal bit `56` -> `mask[6] |= 0x02` -> force DP-sink EDID refresh.
+- The older driver lacks the APP raw-`0x36` entries and also lacks the force-capable EDID callee/caller.
+- So for the panel IDs in that table, BootCamp's 5K enablement likely starts by recognizing the Apple panel in the monitor capability table, then forcing a fresh EDID read through the DP sink during `DisplayCapabilityService` refresh.
+
+Linux relevance:
+
+- The exact table IDs from this 2016 BootCamp driver should not be blindly copied for iMac19,1. For iMac19,1 we already have stronger APP/AE25/AE26 DisplayID/tile evidence in Linux logs and later Windows RE notes.
+- But the mechanism is valuable: Windows gates the recovery on panel identity/capability, then forces EDID refresh. A Linux analogue should likewise be narrowly gated on the internal Apple tiled panel identity/topology, not a global forced EDID read on every DP sink.
+
+Second pass on the first 5K-capable BootCamp driver:
+
+- The forced path was followed below `DalEdidRefreshIfNeededOrForced()` in the 6.0.6237 driver.
+- The force branch calls `DalReadEdidBlocks()` again. That routine reads EDID block 0 and up to 3 extension blocks through the normal I2C-over-AUX machinery.
+- Important IDA names/comments added in the 6.0.6237 database:
+  - `0xb644f8` -> `DalEdidProbeCacheState`
+  - `0xb64030` -> `DalDpAuxReadDpcdLimited16`
+  - `0xb6427c` -> `DalDpAuxWriteDpcdLimited16`
+  - `0xb64c4c` -> `DalDpAuxReadDpcdRetryNak`
+  - `0xb65000` -> `DalDpAuxWriteDpcdRetryNak`
+  - `0xb649b0` -> `DalDpAuxReadEdidBlock128`
+  - `0xb64368` -> `DalDpAuxReadEdidBlock16Chunks`
+  - `0xb64d38` -> `DalDpAuxReadBytesAfterOffsetWrite`
+  - `0xb64f94` -> `DalDpComplianceRespondEdidTest`
+- `DalReadEdidBlocks()` first tries DDC address range `0x50..0x52` until a 128-byte block is returned, then follows the extension count, capped at 3.
+- The only DPCD write side path found under this EDID reader is `DalDpComplianceRespondEdidTest()`:
+  - reads DPCD `0x218`;
+  - if the EDID test bit is set, writes one-byte values around DPCD `0x260/0x261`;
+  - this matches generic DisplayPort EDID compliance-test plumbing, not an Apple-panel-specific 5K wake sequence.
+- No writes to Apple-panel-looking DPCD offsets such as `0x4f1` were found under the forced EDID branch.
+- This makes the BootCamp 6.0.6237 mechanism more modest than a full panel mode switch: for the APP/AE01/AE02/AE05/AE06/AE09/AE0A/AE0D/AE0E panels, the driver recognizes the panel through the monitor capability table, sets the force-EDID bit, and re-reads EDID through the ordinary DP sink path.
+- Practical implication: if Windows does a deeper Apple tiled-panel wake for newer iMacs, it is probably outside this first 5K driver's forced-EDID helper, or appears only in a later driver/table generation. The next high-value target remains the original modern BootCamp driver with the iMac19,1-era panel IDs.
+
+Old-vs-new BootCamp extraction pass:
+
+- Question: is the 6.0.6237 5K enablement a newly added tiled-display parser/mode-set path, or is it a smaller quirk that feeds the already-existing parser?
+- Compared binaries:
+  - old / 4K fallback sample: `tmp_bc_amd_compare/4k_atikmdag.sys`
+  - first 5K-capable sample: `tmp_bc_amd_compare/5k_atikmdag.sys`
+- Raw string scan result:
+  - both binaries already contain SLS/topology/tiled-display vocabulary;
+  - both binaries contain the trace/test string `Test1 5k SetMode`;
+  - therefore those strings alone are not the 6.0.6237 enablement.
+- Post-EDID refresh comparison:
+  - new `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid()` calls a post-refresh helper at `0xc323bc`; if the refresh result is `3`, it enters a mode/capability rebuild helper at `0xbc20a8`;
+  - old `DisplayCapabilityService_RefreshCapsNoForceArg()` has the same broad post-refresh shape through `0xc1da18` and `0xbad480`;
+  - the mode-list rebuild path is present in both old and new drivers. This is not the key delta.
+- Capability translator comparison:
+  - old `TranslateMonitorCapabilityCodeToBitIndex_OldNoCode36()` at `0xc4fdfc` does not recognize raw capability `0x36` / decimal `54`; that input returns `0`;
+  - new `TranslateMonitorCapabilityCodeToBitIndex()` at `0xc649ec` recognizes raw capability `0x36` / decimal `54` and maps it to internal bit index `56`;
+  - new `MonitorCaps_SetCapabilityBit()` then maps internal bit `56` to `capability_mask[6] |= 0x02`;
+  - `DisplayCapabilityService_RefreshCapsAndMaybeForceEdid()` consumes exactly `capability_mask[6] bit 1` as the `force` argument to the downstream DP-sink EDID refresh.
+- EDID / DisplayID parser comparison:
+  - both drivers recognize DisplayID extension blocks via tag `0x70` and DisplayID versions in the `0x11..0x13` family;
+  - both drivers have a `DisplayIdParser` constructor with the same object shape and branch structure;
+  - both drivers have matching DisplayID sub-block parse/cache logic and timing/mode extraction logic;
+  - IDA names/comments added around the parser helpers in both databases to mark this as existing generic infrastructure, not the first-5K-driver delta.
+- Current conclusion:
+  - 6.0.6237 did not appear to add the generic DisplayID/tiled-parser machinery needed for 5K;
+  - it added the Apple-panel capability gate and forced-EDID rerun that makes the existing machinery see fresh panel data;
+  - the concrete static part is the new APP/AE01/AE02/AE05/AE06/AE09/AE0A/AE0D/AE0E raw-`0x36` monitor-capability rows;
+  - the concrete runtime part is raw `0x36` -> internal bit `56` -> `capability_mask[6] bit 1` -> forced downstream DP-sink EDID refresh.
+- Interpretation:
+  - for this first 5K-capable BootCamp driver, the "5K mechanism" is best described as panel-identity-gated forced EDID refresh through existing DisplayID/tile/SLS paths;
+  - it is not, in this binary, an obvious Apple-specific DPCD wake sequence such as a write to `0x4f1`;
+  - for iMac19,1 we still need to inspect the later/original modern BootCamp driver because its panel IDs differ (`AE25`/`AE26` in our Linux evidence), but this older comparison gives us the mechanism shape to look for.
+
+Old-vs-new BootCamp property6 / object-enumeration check:
+
+- Question: did the first 5K-capable BootCamp driver change the hard property6/object-enumeration policy that might suppress the secondary route, rather than only adding the forced-EDID/panel-capability path?
+- Method note:
+  - IDA batch export for the old/new IDBs was blocked by the local IDA batch-mode license prompt, so this pass used `objdump` structural disassembly over the already-extracted binaries;
+  - confidence is good for immediate constants and local control-flow shape, but a live old/new IDA MCP pass would still be useful for nicer names/comments.
+- Compared functions:
+  - old `4k_atikmdag.sys`: raw adapter/source flag population around `0x6c9a0..0x6cc20`;
+  - new `5k_atikmdag.sys`: equivalent raw adapter/source flag population around `0x9f190..0x9f410`.
+- Property/raw-flag result:
+  - both old and new clear the qword at the `+0x8c/+0x90` raw flag area, then set `0x140000` in the same branch shape;
+  - old branch: runtime-cap vfunc `+0x488`, or feature `0x12c` plus root/display-core vfunc `+0x278`, then `or dword ptr [rbx+0x8c], 0x140000` at `0x6cba4`;
+  - new branch: same checks, then `or dword ptr [rbx+0x8c], 0x140000` at `0x9f394`;
+  - neither binary has a visible `0x940000` immediate in the disassembly scan, so the modern `0x940000`-style branch is not the first-5K-driver delta.
+- Object-enumeration / route result:
+  - old driver already updates object `0x3113` at `0xaa2e7a` and object `0x3114` at `0xaa2e87`;
+  - new driver does the same at `0xabaac7` and `0xabaad4`;
+  - both versions compute a grouped mask from per-object/backend state, write it to `0x3113`, then merge the count bits into `0x3114`;
+  - both versions also contain the same AUX/DDC selector resolver vocabulary: index 2 maps to `0x4871`, index 3 maps to `0x4875` (`0xbb83f4..0xbb8457` old, `0xbcdc20..0xbcdc84` new).
+- Conclusion:
+  - the first 5K-capable BootCamp driver did not appear to add the `0x3113/0x3114` internal route concept, nor did it obviously change the property6 hard-suppressor raw branch;
+  - those mechanisms already existed in the older 4K-only driver, which means the older driver likely failed to enable 5K because the existing route/parser machinery did not receive the right fresh Apple-panel capability/EDID data;
+  - this reinforces the prior forced-EDID finding: the 6.0.6237 delta is best read as "feed the already-existing route/tile stack with fresh panel identity" rather than "invent a new secondary object route."
+- Linux implication:
+  - do not expect the old-vs-first-5K diff to reveal a newly added object-constructor recipe for `0x3113`;
+  - the production Linux path should still focus on making the real `0x3113` route exist or survive, then applying the Apple-panel capability/EDID/DPCD policy once that route's AUX service is live;
+  - if we want higher confidence on names, open the old and first-5K IDBs in two IDA MCP instances and annotate the equivalent raw-property and `0x3113/0x3114` route functions directly.
+
+Modern/original BootCamp driver pass:
+
+- IDA MCP target: `C:\proj\reverse\WT6A_INF\B416406\amdkmdag.sys.i64`, input `B416406\amdkmdag.sys`, SHA256 `ac79119d7a64fc2619391ed972febf6c740d0199fd6ebb2fabb4728775a2fc05`.
+- This later driver keeps the same broad mechanism shape, but the iMac19,1-era path is stronger than the 6.0.6237 forced-EDID-only delta:
+  - static main vendor/product capability table at `0x144C4F720`, `361` records;
+  - `APP/AE25` row `149` at `0x144C50070`: source id `0x38`, value `0`;
+  - `APP/AE26` row `150` at `0x144C50080`: source id `0x39`, value `0`;
+  - source id `0x38` maps to pin property tag `0x3A`; source id `0x39` maps to tag `0x3B`;
+  - tag `0x3A` sets pin descriptor byte `+6` bit `2`; tag `0x3B` sets byte `+6` bit `3`.
+- The modern driver has two important consumers for these tags:
+  - EDID side: `ApplyPinCapabilityEdidFixups()` dispatches tags `0x3A/0x3B` to `DoubleEdidPhysicalWidthForTiledCaps()`, which doubles EDID byte `21` when horizontal physical size is less than vertical and less than `0x80`, then recomputes block checksum. This is an Apple tiled-half geometry fixup.
+  - AUX/DPCD side: `DetectDisplayMaybeAssert4F1ForCapableSink()`, `WindowsDM_EnableSecondaryTileIfRequired()`, and `StreamEnableWrite4F1AndPollSinkStatus()` all use descriptor byte `+6` bit `2/3` as Apple/tiled gates before writing sink DPCD `0x4F1 = 1`.
+- `WindowsDM_EnableSecondaryTileIfRequired()` adds one more gate: after the `0x3A/0x3B` descriptor-bit check, the resolved lower display object type must be `128`; only then does it call `SendSecondaryTileOpcode1265Payload1()`.
+- `SendSecondaryTileOpcode1265Payload1()` writes decimal `1265` (`0x4F1`) payload `1`, retries once after `10 ms` on failure, and optionally waits `100 ms` after success.
+- `BringUpDisplayBySignalType()` has another post-bring-up call to the same `0x4F1` helper, but this one is downstream of successful bring-up and is gated by lower-object flag/value `+0x5B4`. For `APP/AE25/AE26`, the static value is `0`, so this is not the primary evidence for the iMac19,1 path.
+- IDA annotations added in the modern IDB:
+  - data comments at `0x144C50070` and `0x144C50080` for the `APP/AE25` and `APP/AE26` rows;
+  - comments at `0x141A9F483`, `0x141A9F4B5`, `0x141A221FD`, `0x141A17548`, and `0x141B6A8C2`;
+  - renamed `0x141A9F1F0` to `ConstructDisplayPinFromEdidApplyVendorCaps`;
+  - renamed `0x1415E73C0` to `RefreshEdidCacheApplyPinCapabilityFixups`.
+- Current BootCamp answer:
+  - older 6.0.6237 shows the first public 5K enablement as panel-identity-gated forced EDID refresh through already-existing DisplayID/tile machinery;
+  - the modern/original driver for the later iMac generation shows the fuller mechanism: panel-identity-derived Apple tiled tags `0x3A/0x3B`, EDID half-panel geometry correction, and multiple tag-gated `0x4F1 = 1` writers.
+- Practical implication:
+  - Windows probably does not need the firmware to hand it the exact same OCLP paired replay state. It needs enough of the real internal DP route/object graph to exist, then the driver can recognize the Apple panel from EDID and assert the Apple/tiled DPCD latch itself.
+  - This does not prove Windows can revive a completely absent secondary connector. It does prove the modern Windows driver has an explicit Apple-panel path that Linux should mimic more closely than the early 6.0.6237 forced-EDID quirk.
+
+Modern BootCamp route-construction pass:
+
+- Notes recheck before this pass:
+  - `new_21` proves the OCLP/diagnostics-style firmware path has paired GOP replay state before the loader: `live=1`, `count=2`, endpoint masks `0x100/0x200`, output banks `00/01`;
+  - `new_22` proves the plain EFI path still has the GOP BootCamp support protocol, but no paired replay state: GOP `3840x2160`, replay `live=0`, `count=0`, only endpoint mask `0x100`;
+  - prior Windows RE already warned that type-128/eDP readiness is an HPD-ready wait/settle path, not a new firmware mailbox opcode.
+- `CreateLinksFromBiosObjectTable()` at `0x141B7A8F0` builds `dc->links[]` from the BIOS/ATOM object table, not from GOP paired replay state:
+  - constructor input `+0x10` is the physical connector index from BIOS enumeration;
+  - constructor input `+0x14` is the runtime `dc->links[]` index, later stored at `display_entry+0x30`;
+  - this index is the one later used by lower DPCD/AUX wrappers to select the link/session.
+- `ConstructLegacyConnectorDisplayEntry()` at `0x141B6D1F0` maps connector object ids into runtime signal classes:
+  - object low byte `0x13` -> signal `32`;
+  - object low byte `0x14` -> signal `128`;
+  - object low byte `0x14` also has eDP-style panel-control creation and HPD-ready callbacks.
+- This resolves the route split:
+  - the Windows type-128 path is the root/eDP-style `0x14` connector path, likely the `0x3114` side;
+  - the Linux/Windows secondary route we have been preserving is `0x3113`, object low byte `0x13`, signal `32`;
+  - therefore the stricter type-128 gate in `WindowsDM_EnableSecondaryTileIfRequired()` is not the whole secondary story. It is a root/eDP-style helper, while signal-32 `0x3113` still has normal DP detect/bring-up and later `0x4F1` opportunities.
+- This also sharpens the likely division between the APP panel ids:
+  - `APP/AE25 -> tag 0x3A -> descriptor byte+6 bit2` can explain root/type-128 detect-time `0x4F1` behavior;
+  - `APP/AE26 -> tag 0x3B -> descriptor byte+6 bit3` is more important for paired/secondary handling during WindowsDM and stream-enable paths;
+  - `DetectDisplayMaybeAssert4F1ForCapableSink()` is only proven to check bit2/tag `0x3A`, while `WindowsDM_EnableSecondaryTileIfRequired()` and `StreamEnableWrite4F1AndPollSinkStatus()` check bit2 or bit3.
+- Both routes depend on the normal per-link DDC/AUX service:
+  - `ConstructLegacyConnectorDisplayEntry()` creates `display_entry+0x140 = CreateDceAuxDdcService(...)`;
+  - `ConstructDceAuxDdcService()` gets firmware I2C/DDC line info and creates the DDC GPIO pin-pair service;
+  - connector low byte `0x14` or `0x0E` sets AUX/DDC service flag bit `1`, confirming type-128 is ordinary AUX-capable display plumbing, not a side-channel.
+- Detect behavior:
+  - `QueryConnectorReadyAndArmEdp128()` runs the eDP HPD-ready and post-ready delay callbacks only when `link+0x38` / signal is `128`;
+  - after the callbacks, readiness still comes from the connector-state/HPD provider for the same object id;
+  - `DcLinkDetectHelper()` can create a `dc_sink` for signal `128` after this readiness gate;
+  - the signal `32` path is separate normal DP detection. It does not run the type-128 HPD callbacks, but can still create/read a `dc_sink` through the same DDC/AUX service and can retry detect while connector-ready.
+- IDA annotations added in the modern IDB:
+  - comments at `0x141B6D6E2`, `0x141B6D727`, `0x141B6D84E`, `0x141B6E8CA`, `0x141B6EA1C`, `0x141B6EB28`, and `0x141B6F1B1`.
+- Current answer refinement:
+  - the Windows driver has enough static machinery to build both the root/type-128 and secondary/signal-32 link objects from BIOS object tables after ExitBootServices; this does not require GOP paired replay state as an input;
+  - but it still requires the firmware/BIOS object table and connector-state/DDC/AUX providers to expose the `0x13` secondary route. If that route is truly absent, the driver cannot invent it from only the primary sink;
+  - for Linux, the closest Windows-shaped production target is still: construct or preserve the real `0x3113` signal-32 route, process the APP/AE25/AE26 capability path, and assert `0x4F1` while that route's AUX service is live. Type-128 eDP readiness explains the root-side path; it is not a replacement for preserving `0x3113`.
+
+Pre-test RE sanity pass: AE26/signal-32 expectations
+
+- Goal before another kernel test: make sure we are not expecting the wrong Windows `0x4F1` writer on the secondary `0x3113` route.
+- `ReadEdidIntoDcSinkThroughPin()` at `0x141EDDD50` is called only by `DcLinkDetectHelper()` after a link-specific `dc_sink` is created:
+  - it reads EDID through the link's normal pin/DDC/AUX path;
+  - constructs a capability-aware pin via `ConstructDisplayPinFromEdidApplyVendorCaps()`;
+  - then calls WindowsDM vtable `+0x158`, which is `WindowsDM_EnableSecondaryTileIfRequired()`.
+- That EDID-time WindowsDM helper is not the expected AE26 secondary writer:
+  - `WindowsDM_EnableSecondaryTileIfRequired()` checks descriptor byte `+6` bit2 or bit3;
+  - but then it requires the selected link/display type to be `128`;
+  - therefore on the signal-32 `0x3113` secondary, this helper can receive an AE26/tag-`0x3B` pin and still skip the `0x4F1` write because the link is not type `128`.
+- The signal-32 secondary still gets the APP/AE26 capability:
+  - `ApplyVendorProductCapabilityTableToPin()` maps `APP/AE26` -> source id `0x39` -> tag `0x3B`;
+  - `SetPinDescriptorCapabilityBitById()` sets descriptor byte `+6` bit3;
+  - `ParseEdidAndPinCapsIntoDcSinkInfo()` copies tag `0x3B` value into sink info `+0xAC` / `dc_sink+0x5B4`, but AE26's static value is `0`, so this value-gated post-bring-up helper is not the main path either.
+- The proven AE26 secondary writer is stream-enable:
+  - `StreamEnableWrite4F1AndPollSinkStatus()` at `0x1414E7810` checks descriptor byte `+6` bit2 OR bit3;
+  - it has no visible `signal == 128` gate at the `0x4F1` write site;
+  - it calls the real stream-enable vfunc first, then writes DPCD `0x4F1 = 1`, retrying once after `10 ms`;
+  - the optional `0x205` poll remains separately gated by descriptor byte `+6` bit5 / tag `0x40`, not proven for `APP/AE25/AE26`.
+- Detect/status-time `WriteSinkDpcd4F1Payload1Retry()` remains root/AE25-biased:
+  - `DetectDisplayMaybeAssert4F1ForCapableSink()` checks only descriptor byte `+6` bit2 / tag `0x3A` before the detect/status `0x4F1`;
+  - it should not be used as proof that AE26/tag `0x3B` gets an early detect-time latch on the secondary.
+- IDA annotations added in the modern IDB:
+  - comments at `0x141EDDE5C`, `0x141A17548`, `0x1414E7DD5`, `0x1414E7E1A`, and `0x1414B2BF3`.
+- Kernel-test implication:
+  - do not judge the patch solely by whether the secondary gets an early detect-time `0x4F1`;
+  - the key Windows-shaped success condition for AE26/secondary is reaching stream finalization with the real `0x3113` AUX route alive, then seeing the stream-enable-time `0x4F1 = 1` write succeed;
+  - if logs show AE26/tag-`0x3B`, stream-enable attempted after both tile streams exist, and `0x4F1` status succeeds, then the RE alignment is good even if the earlier type-128/EDID helper skipped.
+
+Extra pre-test RE pass: mode-11 gate before the stream-enable `0x4F1` writer
+
+- Reason for this pass:
+  - the previous wording "stream-enable writes `0x4F1`" was too broad;
+  - the modern BootCamp stream-enable path has an additional mode/state gate before the `0x4F1` writer can run.
+- New/updated IDA anchors in the modern BootCamp IDB:
+  - `0x141442720`: renamed `UpdateMode11ImmediateStreamEnableFlag`;
+  - `0x1414437B0`: renamed `SelectLinkSettingsRespectMode11Flag`;
+  - `0x1414E59D0`: renamed `SelectFittingLinkSettingsForMode11Stream`;
+  - comments added at `0x14144275A`, `0x1414427BB`, `0x14144284A`, `0x141446C34`, `0x141446C41`, `0x141446F6B`, `0x1414437CA`, `0x14144884B`, `0x1414E78F4`, and `0x1414E7DD5`.
+- `UpdateMode11ImmediateStreamEnableFlag()` is called by `EnableValidatedStreamMaybeAssert4F1()` immediately before the decision to call `StreamEnableWrite4F1AndPollSinkStatus()`:
+  - it queries the stream/display object through vtable offset `+0x160`;
+  - return value `12` clears link-service byte `+0x40A`;
+  - return value `11` sets link-service byte `+0x40A`;
+  - because `EnableValidatedStreamMaybeAssert4F1()` receives `link_service+0x28`, the same byte appears there as `a1+0x3E2`.
+- Therefore the wrapper only calls `StreamEnableWrite4F1AndPollSinkStatus()` when this mode-11 byte is set.
+- If the byte is clear, the wrapper follows the generic validated/cached stream path:
+  - optional fresh training only when cached link settings are absent;
+  - `ProgramCachedLinkStreamSourceThenEnableStream()`;
+  - lower stream finalizer, which our earlier RE mapped to the likely non-converter `0x107` MSA-ignore path for the iMac route;
+  - no call to `StreamEnableWrite4F1AndPollSinkStatus()` from this wrapper.
+- The same mode-11 byte also affects link-setting tuple selection:
+  - when set, `SelectLinkSettingsRespectMode11Flag()` calls `SelectFittingLinkSettingsForMode11Stream()`;
+  - when clear, it uses the indexed/default link-setting tuple path.
+- The DP/MST-style stream constructor at `0x1414486E0` initializes the backing byte `link_service+0x40A` to `0`, so mode `11` must be observed later to enter the immediate `0x4F1` stream-enable wrapper path.
+- Inside `StreamEnableWrite4F1AndPollSinkStatus()` itself:
+  - states `2` and `3` still return success immediately;
+  - state `1` programs/caches the requested tuple, programs `0x316`, calls the lower stream-enable vfunc, promotes state `1 -> 3`, and returns without the later tag-gated `0x4F1` write;
+  - the tag-gated stream-enable `0x4F1` write is therefore on the non-state-1 normal branch.
+- Refined conclusion:
+  - the proven AE26/tag-`0x3B` `0x4F1` writer is real, but it is not unconditional for every stream-enable;
+  - it requires reaching the mode-11/immediate wrapper path and not short-circuiting as state `1`, `2`, or `3`;
+  - a Windows-like already-configured state-1 handoff may correctly perform stream/source finalization without a late `0x4F1` write.
+- Kernel-test implication:
+  - do not treat absence of a late stream-enable-time `0x4F1` as automatic RE mismatch if the Linux path is intentionally following the already-link-configured/state-1 analogue;
+  - for the current kernel direction, the stronger success criteria are: trained secondary `0x3113` preserved, two real tile streams committed, lower stream programming reached, `0x107` bit7/`ignore_msa_timing_param` handled, and no destructive retraining/powerdown;
+  - late `0x4F1` success is still useful evidence on the normal branch, but it is no longer the sole Windows-shape marker.
+- Remaining narrow RE question:
+  - map stream mode values `11` and `12` back to the selected path-mode/display-object fields for the exact iMac 5K pair;
+  - this would tell us whether Windows expects the iMac secondary to use the immediate `0x4F1` branch or the generic cached/finalizer branch during the relevant commit.
+
+Extra pre-test RE pass: mode-11 gate audit and EDID false-lead correction
+
+- Follow-up result:
+  - the EDID parser work is useful, but it does not prove the source of the mode-11 stream-enable gate;
+  - the earlier idea that `UpdateMode11ImmediateStreamEnableFlag()` was directly reading EDID parser-kind constants was too strong.
+- New/updated IDA anchors in the modern BootCamp IDB:
+  - `0x141A9EAC0`: renamed `CreateEdidParserChainFromRawEdid`;
+  - `0x141A9E440`: renamed `CreateEdidExtensionParserForBlock`;
+  - `0x141AFC880`: renamed `IsDisplayIdExtensionBlock`;
+  - `0x141AF02D0`: renamed `IsEdidExtensionTag40_DdcDisplay`;
+  - `0x141AE0020`: renamed `IsEdidExtensionTag10`;
+  - `0x141AF41F0`: renamed `DisplayIdParserVfunc160_MarkTimingFromBlock0D`;
+  - `0x141A38840`: renamed `EdidParserVfunc160_DelegateToNextExtension`;
+  - `0x1419F0C50`: renamed `EdidParserVfunc168_Tag40_Return11`;
+  - `0x1419F0730`: renamed `EdidParserVfunc168_Tag10_Return12`;
+  - `0x1419F0D30`: renamed `EdidParserVfunc168_DisplayId_Return1`;
+  - mode-gate comments corrected at `0x1414427BB` and `0x141446C41`.
+- EDID parser facts that remain solid:
+  - `ConstructDisplayPinFromEdidApplyVendorCaps()` builds the parser chain at pin field `+0x30`;
+  - `CBasePin::Name()` returns that field, so many display paths use the parser chain through the pin/name abstraction;
+  - `CreateEdidExtensionParserForBlock()` selects DisplayID when an extension starts with `0x70` and version `0x11..0x13`;
+  - the captured iMac19,1 primary and secondary EDIDs both have one extension block starting `70 13`;
+  - the decoded captures show DisplayID tiled topology block `0x12`, with tile locations `0,0` and `1,0`.
+- Slot audit correction:
+  - `UpdateMode11ImmediateStreamEnableFlag()` calls vtable slot `+0x160` on `stream_arg+0x178`;
+  - the EDID parser constant-return functions are at parser vtable slot `+0x168`, not `+0x160`;
+  - DisplayID parser `+0x160` is `DisplayIdParserVfunc160_MarkTimingFromBlock0D()`, a timing/block helper that returns success, not the constant `1` parser-kind function;
+  - several non-terminal EDID parser `+0x160` slots delegate to the next extension parser, which further confirms this is not a simple kind constant.
+- `stream_arg+0x178` is also used by stream-enable code as a richer display/sink object:
+  - `ProgramCachedLinkStreamSourceThenEnableStream()` calls its vfunc `+0x38` with argument `1`;
+  - `StreamEnableWrite4F1AndPollSinkStatus()` calls its vfunc `+0x58` to obtain the descriptor/pin-capability object;
+  - the normal stream-enable path also tests its vfunc `+0x198`;
+  - this does not look like a bare EDID parser-chain pointer.
+- Refined conclusion:
+  - the mode-11 byte is still real, but its source is unresolved;
+  - it probably comes from the higher display/mode object stored at `stream_arg+0x178`, not directly from the EDID extension parser-kind constants;
+  - therefore do not infer the mode-11 late `0x4F1` wrapper expectation from the captured DisplayID `70 13` EDID alone.
+- Kernel-test implication:
+  - the current kernel direction does not need to pivot on this false lead;
+  - the stronger Windows-equivalence target remains the generic/cached finalizer path: real secondary `0x3113`, two tile streams, source-DPCD/ASSR, `0x107` MSA timing ignore, cached-link handoff, and avoiding destructive retrain/powerdown;
+  - keep logging late `0x4F1`, but do not force the mode-11 wrapper until the `stream_arg+0x178` vtable path is mapped.
+- Next narrow RE target:
+  - trace where the object stored at `stream_arg+0x178` is assigned;
+  - identify that object's vtable implementations for slots `+0x38`, `+0x58`, `+0x160`, and `+0x198`;
+  - only then decide whether the iMac secondary should reach `StreamEnableWrite4F1AndPollSinkStatus()` or stay on the generic cached/finalizer route.
+
+Extra RE continuation: `stream_arg+0x178` assignment found
+
+- Follow-up result:
+  - the assignment site for the object consumed by `UpdateMode11ImmediateStreamEnableFlag()` was found;
+  - it is not directly the EDID parser chain.
+- New/updated IDA anchors:
+  - `0x141508510`: renamed `BuildStreamArgForDisplayIndex_SetObject178`;
+  - `0x14150896D`: commented as the `stream_arg+0x178` assignment;
+  - `0x1414D2748`: commented where stream-source programming forwards `stream_arg+0x178`;
+  - `0x1414E7989`: commented where the state-1 stream-enable packet forwards `stream_arg+0x178`.
+- `BuildStreamArgForDisplayIndex_SetObject178()` does this:
+  - receives an output stream/mode argument buffer at `a4`;
+  - resolves `v9` from a display-object provider/list lookup using display index `*(a3+0x28)`;
+  - stores `v9` into `a4+0x178`;
+  - then fills timing/mode/source fields and calls the downstream helpers that consume the same object.
+- This explains why stream-enable uses `stream_arg+0x178` as a richer object:
+  - mode gate: vfunc `+0x160`, compared to `11` and `12`;
+  - cached stream-source packet: forwards the object as packet field 0;
+  - state-1 stream-enable packet: forwards the object as packet field 0;
+  - descriptor/capability path: vfunc `+0x58` returns the object used for pin/property lookups.
+- Refined conclusion:
+  - the mode-11 branch is a property of the display object selected for this stream/mode argument;
+  - EDID/DisplayID still feeds that display object, TILE metadata, and capability tags, but the immediate `11/12` decision is one layer above the raw EDID parser.
+- Next narrow RE target:
+  - identify the concrete vtable(s) for the object returned by the provider/list lookup in `BuildStreamArgForDisplayIndex_SetObject178()`;
+  - map that object's `+0x160` implementations and determine what field/state makes it return `11` or `12`;
+  - then re-evaluate whether the iMac secondary is supposed to use the mode-11 `0x4F1` wrapper.
+
+Extra RE continuation: topology display object owns the mode-gate value
+
+- Follow-up result:
+  - the provider behind `stream_arg+0x178` has now been traced one layer further;
+  - `ConstructDal2CoreAndServices()` creates `DisplayTopologyManager` through `CreateDisplayTopologyManagerInterface()` and stores the returned interface at `core+0x60`;
+  - the DS/dispatch init bundle copies `core+0x60` into the provider slot later used by `BuildStreamArgForDisplayIndex_SetObject178()`;
+  - therefore the object stored at `stream_arg+0x178` is selected by the topology manager's display-index lookup, not by an EDID parser directly.
+- New/updated IDA anchors in the modern BootCamp IDB:
+  - `0x14143B930`: renamed `CreateDisplayTopologyManagerInterface`;
+  - `0x141438F50`: renamed `TopologyManager_GetDisplayObjectByIndex`;
+  - `0x1414B7D70`: renamed `TopologyPathBuilder_GetDisplayObjectByIndex`;
+  - `0x141549190`: renamed `DisplayObject_GetCommittedSignalTypeForModeGate`;
+  - `0x141549120`: renamed `DisplayObject_GetPendingSignalType`;
+  - `0x14154A9C0`: renamed `DisplayObject_CommitPendingStreamFields`;
+  - `0x141547CB0`: renamed `DisplayObject_SetSignal12ReportsAs11Flag`;
+  - `0x14154AD10`: renamed `DisplayObject_AddPathInterface`;
+  - `0x14154AD70`: renamed `DisplayObject_ValidateAndSetRequestedSignalType`;
+  - comments added at `0x14142A1B6`, `0x14143B14D`, `0x14143B1D2`, `0x141438F50`, `0x141549190`, `0x141547CB0`, `0x14154A9C0`, `0x14154AD70`, `0x14154144D`, `0x14154145A`, and `0x1415436F3`.
+- Concrete topology-manager path:
+  - `TopologyManager_GetDisplayObjectByIndex()` is vtable slot `0` on the topology-manager interface returned as `outer+0x28`;
+  - it checks `index < outer+0xA4`;
+  - it returns `outer+0xC0[index]`;
+  - `ConstructDisplayTopologyManager()` allocates this display-object array and fills it from the topology display-path builder.
+- Concrete display-object mode gate:
+  - full display objects are created by `CreateFullDisplayObjectInterface()` / `ConstructFullDisplayObject()`;
+  - their interface vtable is `off_141FAB4E8`;
+  - vtable slot `+0x160` is now `DisplayObject_GetCommittedSignalTypeForModeGate()`;
+  - this function reads the committed per-stream signal type at stream-record field `+0x48`;
+  - if display-object byte `+0x1E9` is set and the committed signal type is `12`, it reports `11` instead;
+  - otherwise it returns the committed signal type unchanged.
+- Important stream-record detail:
+  - `DisplayObject_GetPendingSignalType()` reads pending stream-record field `+0x40`;
+  - `DisplayObject_CommitPendingStreamFields()` copies pending fields to committed fields:
+    - `+0x3C -> +0x44`;
+    - `+0x40 -> +0x48`;
+    - `+0x20 -> +0x28`;
+  - the mode gate reads the committed `+0x48` value after this snapshot.
+- Signal-type mapping observed in the packet path:
+  - `sub_141543610()` dispatches packet `0xD00040` into `sub_141542940()` / `sub_141540860()`;
+  - inside `sub_141540860()`, packet case `7` maps subcase `11` to signal type `11`;
+  - the same packet case maps subcase `4` to signal type `12`;
+  - this is a higher-level display/mode programming route that uses the same `11`/`12` vocabulary; the exact final writer into pending stream-record field `+0x40` is still tracked separately below.
+- Refined conclusion:
+  - the "does this stream use the mode-11 immediate `0x4F1` wrapper?" decision is currently best described as:
+    - topology manager chooses display object by display index;
+    - display object has a pending signal type;
+    - pending signal type is committed into stream-record field `+0x48`;
+    - mode gate reads committed `+0x48`, with an optional `12 -> 11` coercion flag.
+  - EDID/DisplayID is still upstream evidence for tile topology and capabilities, but the exact `11` versus `12` decision is a display-object stream state, not a raw EDID-parser kind return.
+- Why this matters for our Windows/BootCamp question:
+  - Windows can plausibly start from a firmware state that is not already equivalent to OCLP's 5K handoff and still build a two-stream/tiled display object in the driver;
+  - the driver has an explicit topology/path construction layer and a later signal-type programming path that can produce signal type `11` or `12`;
+  - this supports the idea that BootCamp can revive or construct the 5K path in driver space, rather than requiring the exact OCLP firmware branch to have already happened.
+- Remaining narrow RE questions:
+  - identify the writer that sets pending stream-record field `+0x40` for the iMac internal paths;
+  - identify who calls `DisplayObject_SetSignal12ReportsAs11Flag()` and under what platform/display condition;
+  - decide whether the iMac 5K pair should normally report committed signal `11`, committed signal `12`, or signal `12` with the coercion flag set.
+
+Extra RE continuation: topology pass applies requested signal types 11 and 12
+
+- Follow-up result:
+  - one more topology-manager pass found an explicit writer for requested signal type `11`/`12`, but not yet the final pending stream-record field read by the mode gate;
+  - this is a useful upstream signal-type assignment, not yet the last writer of committed stream-record field `+0x48`.
+- New/updated IDA anchors:
+  - `0x1414A6690`: renamed `TopologyManager_AssignDerivedDisplaySignalTypes`;
+  - `0x141549360`: renamed `DisplayObject_ApplyRequestedSignalTypeToStreams`;
+  - `0x14149FB60`: renamed `DeriveDisplayObjectFlag416FromSignalAndConfunctionalCount`;
+  - comments added at `0x1414A6839`, `0x1414A690B`, `0x1414A6AFD`, `0x1414A6BCF`, `0x141549360`, and `0x14149FB60`.
+- What `TopologyManager_AssignDerivedDisplaySignalTypes()` does:
+  - iterates topology display objects from the `outer+0xC0` array;
+  - reads each display object's current pending signal type through vfunc `+0x288`;
+  - derives a field stored by display-object vfunc `+0x438`;
+  - reads display-object flags through vfunc `+0x60`;
+  - if flags bit6 is set, first pass calls display-object vfunc `+0x508` with requested signal type `12`;
+  - a later pass, with the caller condition forced false, calls the same vfunc `+0x508` with requested signal type `11` when the same flags bit6 is set.
+- What `DisplayObject_ApplyRequestedSignalTypeToStreams()` does:
+  - validates the requested type against the display object's path capabilities;
+  - calls the same helper used by `DisplayObject_ValidateAndSetRequestedSignalType()`;
+  - writes per-stream requested/derived type fields (`+0x64` / `+0x68` relative to the stream-record base in the outer object view);
+  - it does not directly write the pending field `+0x40` or committed field `+0x48` that `DisplayObject_GetCommittedSignalTypeForModeGate()` reads.
+- Current status:
+  - the explicit `11`/`12` requested-signal assignment strongly links topology/confunctional path construction to the later mode-gate vocabulary;
+  - a later pass identified the pending-field writer: `DisplayObject_SetPendingSignalTypeForAllStreams()` writes outer `+0x68`, equivalent to full display interface `+0x40`;
+  - `DisplayObject_CommitPendingStreamFields()` then snapshots interface `+0x40` into committed interface `+0x48`, which is the field read by the mode gate.
+
+Extra RE continuation: BootCamp SetMode owns an MST-to-SST coercion path
+
+- Follow-up result:
+  - the modern BootCamp driver has an explicit `ApplyMSTtoSSTOptimization` path inside `DSDispatch::SetMode`;
+  - this path toggles the same display-object byte that makes committed signal type `12` (`DisplayPortMst`) report as signal type `11` (`DisplayPort`) to the downstream mode gate;
+  - this is now the best explanation for how Windows reaches the mode-11/4F1 branch without requiring the firmware to have made the exact same OCLP-style handoff.
+- New/updated IDA anchors:
+  - `0x1415001F0`: renamed `SetMode_ApplyMstToSstOptimizationSignalCoercion`;
+  - `0x141500070`: renamed `SetMode_FindMstToSstOptimizationAnchorDisplay`;
+  - `0x1415004A0`: renamed `SetMode_AllDisplaysHaveAtMostTwoTiles`;
+  - `0x14150F0C0`: renamed `DSDispatch_SetMode`;
+  - `0x14150E2F0`: renamed `DSDispatch_BuildApplySetModePaths`;
+  - `0x1415475D0`: renamed `DisplayObject_SetPendingSignalTypeForAllStreams`;
+  - `0x141547670`: renamed `DisplayObject_ValidateRequestedSignalTypeAcrossStreams`;
+  - `0x141547730`: renamed `DisplayObject_DeriveCompatibleSignalTypeForStream`;
+  - `0x14144B670`: renamed `SetModePathList_GetEntryByOrdinal`;
+  - `0x14144B6B0`: renamed `SetModePathList_GetCount`;
+  - `0x14144B5C0`: renamed `SetModePathList_FindEntryByDisplayIndex`;
+  - `0x14150FDB0`: renamed `DSDispatch_LogSetModePathList`.
+- Concrete SetMode chain:
+  - `DSDispatch_SetMode()` logs `All paths will be disabled from ApplyMSTtoSSTOptimization` when `SetMode_ApplyMstToSstOptimizationSignalCoercion()` returns true;
+  - the helper first gates the path list with `SetMode_AllDisplaysHaveAtMostTwoTiles()`;
+  - it then finds an anchor display with `SetMode_FindMstToSstOptimizationAnchorDisplay()`;
+  - for each display in the SetMode path list, it resolves the topology display object through the provider at `a1+0x58`;
+  - if the anchor path metadata flag at timing/path payload `+0x1C` bit 7 is clear, it calls display-object vfunc `+0x318(1)`;
+  - vfunc `+0x318(1)` sets the `12 -> 11` reporting/coercion flag at display interface `+0x1E9`;
+  - if that bit is set, the helper clears the same flag with vfunc `+0x318(0)`.
+- Concrete pending-field chain:
+  - `DisplayObject_SetPendingSignalTypeForAllStreams()` uses the outer display-object base, not the interface base;
+  - it writes the requested type to outer `+0x68`, which is full interface `+0x40`;
+  - it writes the derived compatible type to outer `+0x64`, which is full interface `+0x3C`;
+  - `DisplayObject_CommitPendingStreamFields()` commits `+0x3C -> +0x44`, `+0x40 -> +0x48`, and `+0x20 -> +0x28`;
+  - `DisplayObject_GetCommittedSignalTypeForModeGate()` reads committed `+0x48` and optionally reports `12` as `11`.
+- Detection interaction:
+  - `HandleDisplayDetectionResultAndLiveState()` clears the `12 -> 11` coercion flag unless detection result byte `+0x72` is set;
+  - `DSDispatch::SetMode` can set it again later based on the selected path list;
+  - this explains why detection and SetMode can appear to disagree: detection normalizes live state, SetMode applies the MST-to-SST optimization for the actual mode request.
+
+Extra RE continuation: Windows 5K is a layered driver recipe, not a single firmware call
+
+- Follow-up result:
+  - the modern driver still contains named 5K/tile policy strings and functions:
+    - `DalEnable5kTiledMode`;
+    - `Dal5K60PipeSplit`;
+    - `WindowsDM_EnableSecondaryTileIfRequired`;
+    - `ModeManagerAddDerivedModesIncluding5kTile`;
+    - `CreateModeSolutionWith5KPipeSplitOptionFlags`;
+    - `MarkTimingPipeSplitForHighResAnd5k60`.
+- Mode-manager layer:
+  - `ConstructDalModeManagerWith5kTiledOption()` reads `DalEnable5kTiledMode` into mode-manager byte `+0x80`;
+  - `ModeManagerAddDerivedModesIncluding5kTile()` injects a real `2560x2880` half-tile mode from a `1920x2160` base timing only when the 5K gates pass;
+  - the final `2560x2880` injection is gated by mode-manager flag bit 5 and `DalEnable5kTiledMode`;
+  - `MarkTimingPipeSplitForHighResAnd5k60()` sets timing flag bit 7 when timing aspect matches display geometry and marks high-res/5K timings as pipe-split when `DalSupportMultiPipe` allows it;
+  - `CreateModeSolutionWith5KPipeSplitOptionFlags()` folds mode-manager flag bit 9, derived from `Dal5K60PipeSplit`, into the mode-solution constructor flags.
+- Detection/runtime layer:
+  - `DetectMstDisplayMaybeAssert4F1()` can recover an MST display object, apply requested signal type `12` through display-object vfunc `+0x508`, or reuse an existing display entry and report signal type `11`;
+  - `DetectDisplayAndApplyApple5kOverrides()` preserves an Apple/tiled false-disconnect case when the descriptor tag bit is present and the signal type is `11`;
+  - this points to Windows keeping a real display object alive rather than replacing the second tile with a fake sink.
+- DPCD/latch layer:
+  - `WindowsDM_EnableSecondaryTileIfRequired()` emits DPCD `0x4F1 = 1` only for signal/display type `128` and pin-descriptor bits `+6[2]` or `+6[3]`;
+  - `BringUpDisplayBySignalType()` has a separate post-bring-up route: after successful link/stream bring-up, lower display object flag `+0x5B4` can trigger `SendSecondaryTileOpcode1265Payload1()` with a 100 ms settle;
+  - `ParseEdidAndPinCapsIntoDcSinkInfo()` copies pin property tag `0x3B`'s value field into parsed sink-info `+0xAC`; when the caller output is `dc_sink+0x508`, this becomes `dc_sink+0x5B4`;
+  - therefore `dc_sink+0x5B4` is not a mysterious firmware flag. It is the value of tag `0x3B`, while several other `0x4F1` writers gate only on tag/descriptor-bit presence;
+  - `SendSecondaryTileOpcode1265Payload1()` writes DPCD address `1265` / `0x4F1` payload `1`, retries once after 10 ms, and optionally sleeps 100 ms after success.
+- Current interpretation:
+  - Windows does not appear to require an EFI runtime service or Apple GOP call after the OS driver loads;
+  - the visible Windows mechanism is driver-owned: preserve or recreate real route objects, derive a per-tile 5K mode, choose a 5K pipe-split/view solution, SetMode the real paths, and assert `0x4F1` only after the relevant AUX/link object exists;
+  - this supports the "Windows can revive/build 5K from a plain-ish state" theory more than the "Windows simply inherits an OCLP-like full 5K firmware state" theory.
+- Remaining narrow question:
+  - for the iMac19,1 `APP/AE26` style route, the static tag `0x3B` value appears to be `0`, so the value-gated post-bring-up `dc_sink+0x5B4` path may not be the important one;
+  - the next useful RE target is which presence-gated `0x4F1` writer actually runs for the Apple 5K internal panel: detect/status, WindowsDM type-128 helper, or stream-enable/post-enable path.
+
+Extra RE continuation: classify the presence-gated `0x4F1` writers
+
+- Follow-up result:
+  - the candidate `0x4F1` writers are not equivalent;
+  - they use different descriptor bits, different AUX objects, and different ordering relative to link/stream enable.
+- Writer 1: detect/status-time path:
+  - `ProbeDisplayStatusMaybeAssert4F1()` and `DetectDisplayStatusMaybeAssert4F1()` both call `DetectDisplayMaybeAssert4F1ForCapableSink()`;
+  - `DetectDisplayMaybeAssert4F1ForCapableSink()` checks connected-pin descriptor byte `+6` bit 2 only;
+  - this corresponds to tag `0x3A` presence;
+  - it writes DPCD `0x4F1 = 1` through `WriteSinkDpcd4F1Payload1Retry()`;
+  - `WriteSinkDpcd4F1Payload1Retry()` resolves the display object id, finds the display-map entry, and uses display-map entry `+0x18` as the AUX/DPCD interface;
+  - therefore this writer is early/detect-side and is not proven to cover an AE26/tag-`0x3B`-only secondary path.
+- Writer 2: `WindowsDM_EnableSecondaryTileIfRequired()`:
+  - checks connected-pin descriptor byte `+6` bit 2 or bit 3;
+  - therefore it accepts tag `0x3A` or tag `0x3B`;
+  - it still requires the selected link/display type to be `128`;
+  - then it calls `SendSecondaryTileOpcode1265Payload1()`;
+  - this remains a root/eDP-style helper, not proof that the internal secondary `0x3113` route should use this exact entry point.
+- Writer 3: post-bring-up `BringUpDisplayBySignalType()`:
+  - runs after signal-type-specific bring-up succeeds;
+  - checks lower display object `dc_sink+0x5B4`;
+  - `dc_sink+0x5B4` is copied from tag `0x3B`'s value field;
+  - for the static AE26-style record, tag `0x3B` is present but value appears to be `0`, so this value-gated helper may not run for our panel.
+- Writer 4: stream-enable lifecycle path:
+  - `EnableValidatedStreamMaybeAssert4F1()` reaches `StreamEnableWrite4F1AndPollSinkStatus()` only when `UpdateMode11ImmediateStreamEnableFlag()` sets the link-service immediate flag from committed signal type `11`;
+  - the committed type can be naturally `11`, or `12` coerced to `11` by `SetMode_ApplyMstToSstOptimizationSignalCoercion()`;
+  - `StreamEnableWrite4F1AndPollSinkStatus()` accepts connected-pin descriptor byte `+6` bit 2 or bit 3, so it accepts tag `0x3A` or `0x3B`;
+  - the write happens on the non-state-1 normal stream-enable branch after link/stream programming and the real stream-enable vfunc call;
+  - it writes DPCD `0x4F1 = 1` through the link-service AUX object at `this+0x90`, retries once after 10 ms, then transitions the stream-enable state to `2`;
+  - this is currently the strongest Windows analogue for the AE26/tag-`0x3B` internal secondary route.
+- Updated interpretation:
+  - for Linux plain/probe boot work, the most faithful target is not an unconditional early primary `0x4F1` pulse;
+  - it is preserving or creating the real secondary AUX/link route, reaching a mode-11-equivalent stream-enable path, programming the stream, then asserting `0x4F1` on the real secondary AUX at the same lifecycle point Windows uses.
+
+Extra RE continuation: assumptions checked against IDA
+
+- Scope:
+  - this was a confirmation pass on the modern BootCamp `amdkmdag.sys` IDB at `B416406/amdkmdag.sys.i64`;
+  - no kernel changes were made in this pass;
+  - IDA names/comments were refreshed for the capability-table, SetMode coercion, and `0x4F1` writer functions.
+- Confirmed: Apple panel capability provenance:
+  - static row `0x144C50070` bytes decode as manufacturer `0x1006`, product `0xAE25`, source id `0x38`, value `0`;
+  - static row `0x144C50080` bytes decode as manufacturer `0x1006`, product `0xAE26`, source id `0x39`, value `0`;
+  - `MapCapabilityTableIdToPinPropertyTag()` maps source id `0x38` to pin property tag `0x3A`;
+  - the same mapper maps source id `0x39` to pin property tag `0x3B`;
+  - therefore `APP/AE25 -> tag 0x3A` and `APP/AE26 -> tag 0x3B` are no longer just notes-derived assumptions.
+- Confirmed: presence bit and value field must be kept separate:
+  - `ApplyVendorProductCapabilityTableToPin()` inserts the mapped pin property and sets the corresponding descriptor bit;
+  - `ApplyPinCapabilityEdidFixups()` dispatches both tag `0x3A` and tag `0x3B` to `DoubleEdidPhysicalWidthForTiledCaps()`;
+  - `ParseEdidAndPinCapsIntoDcSinkInfo()` copies tag `0x3B`'s value field into parsed sink info `+0xAC`, which becomes `dc_sink+0x5B4` for the known caller;
+  - since the static AE26 row value is `0`, the `dc_sink+0x5B4` post-bring-up helper is weaker evidence than the descriptor-bit-gated writers.
+- Confirmed: writer split:
+  - `DetectDisplayMaybeAssert4F1ForCapableSink()` only checks descriptor byte `+6` bit 2, matching tag `0x3A`;
+  - `WindowsDM_EnableSecondaryTileIfRequired()` accepts bit 2 or bit 3, but still requires selected link/display type `128`;
+  - `StreamEnableWrite4F1AndPollSinkStatus()` accepts bit 2 or bit 3 and writes DPCD `0x4F1 = 1` through the link-service AUX object at `this+0x90`;
+  - the stream-enable writer remains the strongest static match for an AE26/tag-`0x3B` secondary tile path.
+- Confirmed: mode-gate bridge:
+  - `StreamEnableWrite4F1AndPollSinkStatus()` has one direct code xref, from `EnableValidatedStreamMaybeAssert4F1()`;
+  - that wrapper calls the stream-enable writer only after `UpdateMode11ImmediateStreamEnableFlag()` sets the immediate flag from reported signal type `11`;
+  - `DSDispatch_SetMode()` calls `SetMode_ApplyMstToSstOptimizationSignalCoercion()`;
+  - the SetMode helper toggles `DisplayObject_SetSignal12ReportsAs11Flag()`, and `DisplayObject_GetCommittedSignalTypeForModeGate()` then reports committed signal type `12` as `11`;
+  - this supports the interpretation that Windows reaches the mode-11/`0x4F1` branch through normal SetMode/display-object state, not through a hidden EFI runtime callback.
+- Still inferred:
+  - static RE still cannot prove which branch executes on a live iMac19,1 without runtime trace;
+  - the best current assumption is that the Windows path either reaches the normal mode-11 stream-enable writer for AE26, or reaches a cached/state-1 analogue where absence of a late `0x4F1` write is not itself a mismatch;
+  - the Linux target should continue to be route-preservation plus Windows-shaped stream/link finalization on the real secondary `0x3113` AUX route, with logs distinguishing state-1/cached behavior from the normal writer path.
+
+Extra RE continuation: probable Windows SetMode and stream-commit recipe
+
+- Scope:
+  - this pass tried to reduce the "probably" around what Windows does once SetPathMode/SetMode owns the panel;
+  - the focus was not another `0x4F1` writer search, but the path-state machinery that decides whether Windows uses normal stream-enable, cached/state-1 stream-enable, or the MST-to-SST optimization path.
+- Confirmed: `ApplyMSTtoSSTOptimization` is a real path-state transformation:
+  - `SetMode_AllDisplaysHaveAtMostTwoTiles()` rejects only displays whose descriptor reports more than two tiles, so an Apple dual-tile 5K panel passes this gate;
+  - `SetMode_FindMstToSstOptimizationAnchorDisplay()` returns an anchor display index; for multi-path lists it delegates anchor selection to the topology/optimization manager at `a1+0x38` vfunc `+0x40`;
+  - `DSDispatch_SetMode()` calls `SetMode_ApplyMstToSstOptimizationSignalCoercion()` in the pre-pass;
+  - `DSDispatch_BuildApplySetModePaths()` calls the same helper again while constructing live path-state records;
+  - when the anchor exists and anchor timing/path metadata `+0x1C` bit 7 is clear, non-anchor paths are marked with skip-enable / force-disable bits `0x100000` and `0x80000`;
+  - when the helper returns true, all built path-state records also receive the `0x80000` optimization/force-disable metadata bit.
+- Interpretation:
+  - Windows is probably not simply enabling two independent tile streams in the most direct way;
+  - it has an explicit "MST-to-SST optimization" layer that can coerce a DisplayPortMST-style object to report as DisplayPort mode `11`, then suppress at least some non-anchor enable work;
+  - this makes the mode-11 `0x4F1` writer path less mysterious: Windows can reach it from SetMode-selected display-object state even if the hardware topology originally looked MST/tiled.
+- Confirmed: SetPathMode still builds real stream objects and a real commit context:
+  - `WindowsDM_SetPathMode_BuildStreamsAndCommit()` allocates a candidate DC stream with `AllocateDcStreamForDisplayObject()`;
+  - it populates the stream through `BuildDcStreamFromSelectedModeObject()`;
+  - it then writes the new stream to `display_object+0x38` and calls `AddDcStreamToCommitContextArray()`;
+  - final commit goes through `DcCommitStreams_BuildValidateAndCommit()`;
+  - the parallel `DalWDDM_SetPathMode_BuildStreamsAndCommit()` path follows the same shape.
+- Confirmed: peer/tile streams are actively rebalanced, not ignored:
+  - after building a stream whose type field `stream+0x3D4` is `64`, SetPathMode calls `RebalancePeerStreamsAfterNewStreamBuild()`;
+  - that helper finds peer display objects whose live stream points at the same lower object and compatible peer state;
+  - it can clone/rebalance stream state, write the peer stream back to peer `display_object+0x38`, and add that peer stream to the same DC commit context;
+  - this is another clue that Windows owns a real paired-display/peer-stream model and is not relying on a post-boot firmware service to do the display composition.
+- Confirmed: state-1 reuse is strict trained-link reuse:
+  - `SetState1IfDpcdReportsTrainedLink()` calls `RecoverActiveDpLinkSettingsFromDpcd()`;
+  - that reads DPCD `0x100/0x101`, `0x003`, and lane-status bytes `0x202/0x203`;
+  - it refuses to set state `1` unless recovered lane count and link rate are nonzero and lane-status bits look trained/locked;
+  - therefore Windows state-1 is not just "cached tuple exists"; it is "the link is already trained according to live DPCD".
+- Confirmed: mode-11 normal enable chooses link settings from stream demand:
+  - `SelectLinkSettingsRespectMode11Flag()` switches to `SelectFittingLinkSettingsForMode11Stream()` only when the mode-11 immediate flag is set;
+  - the fitting helper starts from the required stream payload/bandwidth, checks explicit link-setting override state if present, then walks available link tuples until one has enough capacity;
+  - this supports treating the normal mode-11 branch as a real Windows training/enable path, not a blind HBR2/default tuple replay.
+- Confirmed: the non-immediate cached path is not a no-op:
+  - `ProgramCachedLinkStreamSourceThenEnableStream()` calls `ProgramPeerSourceUpdateBeforeStreamEnable()`;
+  - it calls `ProgramStreamSourceWithLinkSettings()` using the cached tuple at link-service `+0x8C`;
+  - it marks the display object enabled through vfunc `+0x38`;
+  - it then calls the real stream-enable finalizer vfunc `+0x98`;
+  - mapped DP finalizers can program source-side DPCD such as `0x170`, `0x107`, and `0x316` depending on branch and stream fields.
+- Updated working model:
+  - if Windows inherits a trained secondary link, it can use strict state-1 reuse and avoid destructive retraining;
+  - if it does not inherit a trained secondary link, the mode-11 normal path has enough machinery to pick link settings, train/enable, program source-side DPCD, and finally assert tag-gated `0x4F1`;
+  - the MST-to-SST optimization can make the selected display object report mode `11` and can suppress non-anchor enable work, so Linux should be careful not to model Windows as "enable both tile paths independently, then latch";
+  - a closer Linux analogue may be: preserve or recreate the peer/secondary route, use one selected/anchor path to drive the mode-11 stream-enable decision, keep peer stream metadata coherent, and only then run the real secondary AUX/source finalization.
+- Still unknown:
+  - the exact runtime value of the anchor path's `+0x1C` bit 7 on iMac19,1;
+  - whether a plain Windows BootCamp boot reaches state-1 reuse from firmware-trained DPCD or takes the normal mode-11 training branch;
+  - whether the non-anchor skip-enable flags mean "do not enable the second tile at all" or "do not independently enable it because peer/anchor machinery will cover it";
+  - these unknowns are now narrow enough that a Windows runtime trace of SetMode logs/DPCD would answer them, but static RE already points away from a hidden EFI runtime call.
+
+Extra RE continuation: SetMode skip/disable bits are consumed for real
+
+- Scope:
+  - this pass followed the `0x80000` and `0x100000` path-state bits after `DSDispatch_BuildApplySetModePaths()` sets them;
+  - this was meant to answer whether the MST-to-SST optimization bits are just metadata or whether they change the later enable/disable sequence.
+- New/updated IDA anchors:
+  - `0x141502C40`: renamed `DSDispatch_BlankDisableSetModePaths`;
+  - `0x1415022D0`: renamed `DSDispatch_EnableLinksAndUnblankSetModePaths`;
+  - `0x14150AB40`: renamed `DSDispatch_RunFullSetModeTransition`;
+  - `0x14150BCB0`: renamed `DSDispatch_ApplySetModeTransition`;
+  - `0x1414D9040`: `PerformLinkTrainingWithAssrPatternPolicy`.
+- Confirmed: bit `0x80000` / bit 19 forces the blank/disable phase:
+  - `DSDispatch_BlankDisableSetModePaths()` computes `DisableOutput` as existing bit 3 OR bit 19;
+  - therefore the `0x80000` bit set by `ApplyMSTtoSSTOptimization` is not cosmetic;
+  - it causes the path to enter the blank/disable handling before the lower SetMode apply step.
+- Confirmed: bit `0x100000` / bit 20 is a real `SkipEnable` gate:
+  - `DSDispatch_EnableLinksAndUnblankSetModePaths()` only performs `EnableLink` / `ChangeMode` / `UnblankStream` when bit 20 is clear;
+  - if bit 20 is set, the function logs `SkipEnable` for that display path;
+  - therefore the non-anchor path marked by the MST-to-SST optimization is not re-enabled through the ordinary enable loop.
+- Confirmed: call order:
+  - `DSDispatch_RunFullSetModeTransition()` calls `DSDispatch_BlankDisableSetModePaths()`;
+  - it waits 100 ms;
+  - it invokes the lower SetMode apply path;
+  - it then calls `DSDispatch_EnableLinksAndUnblankSetModePaths()`;
+  - the other transition helper, `DSDispatch_ApplySetModeTransition()`, also calls blank/disable first, but calls enable/unblank only when requested by caller or by path-state bit 22.
+- Timing flag clarification:
+  - `MarkTimingPipeSplitForHighResAnd5k60()` sets timing record dword 7 bit 7 when the timing aspect matches the display geometry;
+  - the SetMode MST-to-SST helper tests this same bit through the path timing pointer at `+0x18`, dword `+0x1C`;
+  - therefore the anchor bit is tied to selected timing / pipe-split eligibility, not a bootloader or firmware-mode flag.
+- Link-training clarification:
+  - normal mode-11 enable reaches `TryEnableLinkWithHbr2Fallback()`;
+  - if requested link settings match the cached tuple, it can skip fresh training;
+  - if they do not match, it calls `ProgramAssrThenTrainLinkSettings()`;
+  - that sequence programs requested link settings/cache, classifies ASSR policy, writes DPCD `0x10A`, and enters link training;
+  - `PerformLinkTrainingWithAssrPatternPolicy()` writes DPCD `0x100/0x101` as a two-byte transfer, then writes DPCD `0x107`, then performs the lane-training sequence.
+- Updated working model:
+  - Windows' MST-to-SST optimization deliberately disables/blankets outputs first and can skip the ordinary re-enable of the non-anchor path;
+  - the second tile is therefore likely kept coherent through peer-stream / selected-stream state and lower DC commit machinery, not through a symmetric "enable both paths independently" loop;
+  - for Linux, this makes a blind "force both tile streams through the same late link-enable path" look less Windows-shaped;
+  - the better target remains preserving/recreating the real secondary route, ensuring source/link DPCD setup happens while AUX is alive, and avoiding destructive independent re-enable/retrain behavior when the route is already part of a paired optimized commit.
+- Still unknown:
+  - the exact anchor selected on live iMac19,1 Windows;
+  - whether the skipped non-anchor path still receives all necessary source-side DPCD through peer-stream rebalance/lower commit callbacks;
+  - whether plain BootCamp starts with DPCD lane status trained enough for strict state-1 or has to run the normal mode-11 training branch.
+
+Extra RE continuation: skipped secondary still enters the lower SetMode/sync machinery
+
+- Scope:
+  - this pass focused on the non-anchor/secondary tile after `ApplyMSTtoSSTOptimization` marks it with bit `0x100000` / `SkipEnable`;
+  - the target question was whether Windows drops that path entirely, or whether it remains in the commit/synchronization list and only skips the later DS-level enable loop.
+- New/updated IDA anchors:
+  - `0x141508E90`: renamed `BuildSetModeStreamArgListForPaths`;
+  - `0x1414D5470`: renamed `AllocateSetModeStreamArgList`;
+  - `0x1414D5370`: renamed `SetModeStreamArgList_Append`;
+  - `0x1414D55C0`: renamed `SetModeStreamArgList_Get`;
+  - `0x1414D5600`: renamed `SetModeStreamArgList_Count`;
+  - `0x1414FCEF0`: renamed `SyncManager_ApplySetModeSynchronizationState`;
+  - `0x1414F98C0`: renamed `SyncManager_ApplyGLSyncSynchronization`;
+  - `0x1414FBB20`: renamed `SyncManager_ApplyInterPathSynchronization`;
+  - `0x1414FB7E0`: renamed `SyncManager_FindInterPathPendingTimingServer`;
+  - `0x1414FC570`: renamed `SyncManager_SetupInterPathSynchronization`;
+  - `0x1414FEA50`: renamed `SyncManager_SetupTimingSynchronization`;
+  - `0x1414F8560`: renamed `SyncManager_ValidateTimingSyncRequest`.
+- Confirmed: the stream-arg list keeps every SetMode path:
+  - `AllocateSetModeStreamArgList()` allocates a list with room for six entries;
+  - `SetModeStreamArgList_Append()` copies each `0x298`-byte stream/mode argument into that list;
+  - `BuildSetModeStreamArgListForPaths()` loops over the SetMode path count and appends one stream/mode argument per path;
+  - each argument stores the resolved display object at `stream_arg+0x178`, then fills view/timing/source fields from the selected path.
+- Confirmed: the full transition submits this list before the later skip-enable loop:
+  - `DSDispatch_RunFullSetModeTransition()` builds the full stream-arg list;
+  - it marks each stream-arg as active/change-mode style work, then calls `SyncManager_ApplySetModeSynchronizationState()` on the full list;
+  - it runs `DSDispatch_BlankDisableSetModePaths()`;
+  - it waits 100 ms;
+  - it invokes the lower SetMode apply vfunc with the full stream-arg list;
+  - only after that does it call `DSDispatch_EnableLinksAndUnblankSetModePaths()`, where bit `0x100000` can produce `SkipEnable` for the non-anchor path.
+- Confirmed: the alternate transition path has the same shape:
+  - `DSDispatch_ApplySetModeTransition()` also builds a full stream-arg list;
+  - it runs the SyncManager pass, blank/disable, then submits the full list through a lower apply vfunc;
+  - only after the lower apply does it optionally run the DS-level enable/unblank loop.
+- Confirmed: inter-path synchronization is real state, not just logging:
+  - `SyncManager_SetupTimingSynchronization()` validates requested timing sync and dispatches inter-path requests to `SyncManager_SetupInterPathSynchronization()`;
+  - `SyncManager_SetupInterPathSynchronization()` copies the requested sync source/target tuple into a per-display sync-state record and marks it active/pending;
+  - `SyncManager_FindInterPathPendingTimingServer()` can promote one pending inter-path client to a local timing server and point peer clients at it;
+  - `SyncManager_ApplyInterPathSynchronization()` then emits `HWSyncRequest_Set_InterPath` for matching source/target pairs.
+- Interpretation:
+  - Windows is not simply discarding the non-anchor tile when it marks it `SkipEnable`;
+  - the non-anchor still has a stream/mode argument, still participates in synchronization setup, and is still present when the lower mode-set apply is called;
+  - `SkipEnable` appears to suppress the later DS-owned `EnableLink` / `ChangeMode` / `UnblankStream` loop, not the earlier lower commit/sync machinery;
+  - for Linux this argues against a symmetric "late-enable both tiles independently" model;
+  - a closer Windows-shaped bring-up should keep both tile paths in the atomic/commit state, preserve the secondary route/AUX object, apply paired timing/source metadata, and avoid retraining or re-enabling the secondary through a separate late path if the lower paired commit already owns it.
+- Kernel-facing next question:
+  - can we make Linux's tile-pair path keep the secondary stream/route alive while suppressing the destructive part of the independent secondary enable/retrain sequence;
+  - if yes, the next kernel experiment should log and gate secondary link training/re-enable separately from secondary stream inclusion, because Windows treats those as different layers.
+
+Extra RE continuation: lower apply resolves to HWSequence/HWSync, not hidden firmware
+
+- Scope:
+  - this pass followed the lower vfuncs that receive the complete stream-arg list before `DSDispatch_EnableLinksAndUnblankSetModePaths()` can skip the non-anchor path;
+  - the goal was to answer whether this lower layer is another DP/firmware SetMode path or a Windows-owned synchronization/hardware-sequence layer.
+- Corrected call target:
+  - `DSDispatch_RunFullSetModeTransition()` calls `HWSequenceService` vfunc `+0x2B0`;
+  - the concrete target for the HWSequence interface returned by `ConstructHWSequenceServiceForAsic()` is `HwSeq_ApplySetModeHWSyncStateList()`;
+  - therefore the vfunc is not a hidden Apple firmware call and not directly a DPCD writer;
+  - it is a Windows HWSequence/HWSync application pass over the full stream-arg list.
+- New/updated IDA anchors:
+  - `0x14155A050`: renamed `HwSeq_ApplySetModeHWSyncStateList`;
+  - `0x14155A100`: renamed `HwSeq_BuildAffectedHWSyncPathMask`;
+  - `0x14155D660`: renamed `HwSeq_RunHardwareSetModeAndApplyHWSync`;
+  - `0x1415E2C60`: renamed `HWSync_ApplyInterPathPreWorkForSetModeList`;
+  - `0x1415E2AD0`: renamed `HWSync_DispatchPerStreamSyncState`;
+  - `0x1415E2D60`: renamed `HWSync_BuildAffectedPathMaskForSetModeList`;
+  - `0x14156F180`: renamed `HWSync_AdjustDpMstEdpSourceSignalForInterPath`;
+  - `0x14156FC40`: renamed `HWSync_ApplyModeMaskToEligibleStreams`;
+  - `0x1415E0F00`: renamed `HWSync_StateMatchesModeMask`;
+  - `0x1415E1F00`: renamed `HWSync_EnableGenlockForStream`;
+  - `0x1415E1840`: renamed `HWSync_EnableGenlockTimingServerForStream`;
+  - `0x1415E11A0`: renamed `HWSync_EnableFreerunForStream`;
+  - `0x1415E10A0`: renamed `HWSync_DisableFreerunForStream`;
+  - `0x14156F770`: renamed `HWSync_EnableShadowForStream`;
+  - `0x14156FEE0`: renamed `HWSync_FinalizeSetModeSyncStateList`.
+- Confirmed: full transition HWSync pass:
+  - `HwSeq_ApplySetModeHWSyncStateList()` first calls `HWSync_ApplyInterPathPreWorkForSetModeList()` on the complete stream list;
+  - it then calls `HWSync_DispatchPerStreamSyncState()`;
+  - it finally calls the inner HWSync finalizer vfunc, which maps to `HWSync_FinalizeSetModeSyncStateList()`.
+- Confirmed: hardware SetMode path also runs HWSync:
+  - `DSDispatch_ApplySetModeTransition()` calls HWSequence vfunc `+0x30`;
+  - the concrete target is `HwSeq_RunHardwareSetModeAndApplyHWSync()`;
+  - this path does the main hardware set-mode sequence over the complete stream list;
+  - near the end, it also calls `HWSync_ApplyInterPathPreWorkForSetModeList()` before returning to the DS-level optional enable/unblank loop.
+- Confirmed: `stream_arg+0x168` / dword `+360` is the HWSync action state:
+  - state `1` is inter-path sync;
+  - state `2` dispatches to genlock;
+  - state `3` dispatches to genlock timing-server;
+  - state `4` dispatches to freerun;
+  - state `5` dispatches to shadow;
+  - state `6` dispatches to disable/reset.
+- Confirmed: state `1` inter-path handling touches all paired entries:
+  - `HWSync_ApplyInterPathPreWorkForSetModeList()` scans the full list for any state-`1` entry;
+  - if any exists, it runs `HWSync_AdjustDpMstEdpSourceSignalForInterPath()`;
+  - for state-`1` entries grouped by timing-server/source id, the helper finds DP-MST/eDP peers and can call a source-side vfunc at `+0xB0` / `176`;
+  - when the sync group contains a DP-MST/eDP peer plus a non-DP peer with signal type `9..14`, it writes the peer signal type to the DP-MST/eDP source object;
+  - when the group contains only DP-MST/eDP peers, it writes signal/type `8` to those source objects.
+- Confirmed: state `1` then applies a mode mask:
+  - after the source-signal adjustment, state-`1` prework calls `HWSync_ApplyModeMaskToEligibleStreams()` with mask `5`;
+  - `HWSync_StateMatchesModeMask()` applies mask bit 0 to state `1`, so this pass covers all state-`1` inter-path entries;
+  - this is separate from the later DS-level `EnableLink` / `ChangeMode` / `UnblankStream` loop where the non-anchor can still hit `SkipEnable`.
+- Interpretation:
+  - Windows' "skipped secondary" is not inert;
+  - it still participates in a complete stream list, hardware set-mode/HWSync sequencing, inter-path timing grouping, and source-signal adjustment;
+  - the later `SkipEnable` therefore means "do not run the ordinary DS per-path enable/unblank for this path", not "do not include this tile in paired timing/source setup";
+  - this is the strongest static evidence so far that Linux should model tile-pair bring-up as a paired atomic commit plus selective suppression of destructive secondary late-enable/retrain work.
+- Kernel-facing implication:
+  - our current tile-pair failures may not be solved by one more DPCD wake byte alone;
+  - Windows appears to establish a source/timing relationship between the two internal display paths before the skip-enable point;
+  - the next Linux experiment should log whether the two CRTCs/connectors have an explicit timing-source / sync-source relationship at atomic commit time, and should separate "include secondary stream" from "train/re-enable secondary link".
+
+Extra RE continuation: who creates state-1 inter-path HWSync
+
+- Scope:
+  - this pass followed the producer of `stream_arg+0x168 == 1`;
+  - the goal was to answer whether state `1` is created by the HWSync layer itself, by a hidden firmware mailbox, or by earlier DS/SyncManager SetMode state.
+- Confirmed writer:
+  - state `1` is written into stream args by `SyncManager_ApplyInterPathSynchronization()` only after SyncManager already has accepted inter-path timing-sync records;
+  - client stream args get `stream_arg+0x168 = 1` at `0x1414FBD15`;
+  - the timing-server stream arg also gets `stream_arg+0x168 = 1` at `0x1414FBE4B` when at least one client is paired;
+  - therefore HWSync consumes state `1`; it does not invent the pairing decision.
+- New/updated IDA anchors:
+  - `0x141506BD0`: renamed `DSDispatch_PrepareSetModeInterPathTimingSync`;
+  - `0x141507350`: renamed `SetMode_TimingRecordsMatchForInterPathSync`;
+  - `0x1414FE2E0`: renamed `SyncManager_GetTimingSyncStateForDisplay`;
+  - `0x1414FE730`: renamed `SyncManager_ResetTimingSynchronizationForDisplay`;
+  - `0x1414FC030`: renamed `SyncManager_ResetInterPathSynchronization`;
+  - `0x1414FAD00`: renamed `SyncManager_ResetGLSyncSynchronization`;
+  - `0x141501F30`: renamed `SetMode_TimingPayloadsDifferForMstSstOptimization`;
+  - `0x141507F70`: renamed `SetMode_BuildTimingRecordForDisplay`.
+- Confirmed request builder:
+  - `DSDispatch_PrepareSetModeInterPathTimingSync()` scans the built SetMode path-state list;
+  - path-state bit `0x8000` at `path_state+0x14` marks the timing-server/anchor path;
+  - the first path with bit `0x8000` contributes its display index as the local timing server for later client requests;
+  - before creating new requests it queries the existing SyncManager record with `SyncManager_GetTimingSyncStateForDisplay()`;
+  - when it needs a fresh request, it first clears the old state through `SyncManager_ResetTimingSynchronizationForDisplay()`;
+  - it then builds a request tuple with `request[0] = 1`, meaning inter-path timing sync;
+  - `request[1] = 1` for the `0x8000` anchor path and `request[1] = 2` for client paths;
+  - for a non-anchor path, `request[2] = 1` and `request[3] = anchor_display_index`, matching the `SyncSrcTgtType_LocalTimingServer` validation path already seen in `SyncManager_ValidateTimingSyncRequest()`;
+  - if `SyncManager_SetupTimingSynchronization()` returns `3`, the path-state bit `0x20` is set to remember that accepted sync work exists for this path.
+- Confirmed compatibility gate:
+  - `SetMode_TimingRecordsMatchForInterPathSync()` compares the selected timing records before inter-path setup is kept or created;
+  - the check requires matching timing dimensions and matching timing flag bits `0`, `1`, `2..5`, `6`, `7`, and `9`;
+  - this means Windows is not pairing arbitrary outputs just because two paths exist;
+  - it only creates the inter-path timing relationship when the selected modes/timing payloads are compatible enough to be phase-linked.
+- Confirmed anchor creation:
+  - `DSDispatch_BuildApplySetModePaths()` sets path-state bit `0x8000` while building the SetMode path-state list;
+  - its preferred anchor is the first path whose lower display/descriptor object reports both vfunc `+0x2A8` and vfunc `+0x238` as true;
+  - if no path passes that descriptor capability test, it falls back to marking the first built path with bit `0x8000`;
+  - this prevents the later inter-path builder from running without any timing-server candidate.
+- Confirmed pipe-split connection:
+  - the same descriptor vfunc `+0x2A8` appears in `ModeListContainsPipeSplitTiming()`;
+  - there it gates the scan that calls `MarkTimingPipeSplitForHighResAnd5k60()`;
+  - `MarkTimingPipeSplitForHighResAnd5k60()` requires DAL option `0x587` / `DalSupportMultiPipe` before it marks timings as pipe-split;
+  - the 5120x2880@60-style branch sets `timing_record[9]` low bits to `2`;
+  - `ModeListContainsPipeSplitTiming()` treats `timing_record[9] & 3 > 1` as evidence that the mode list contains a pipe-split timing;
+  - this makes vfunc `+0x2A8` look like a high-res / pipe-split-capable display signal, although I have not assigned a final method name to it.
+- Confirmed MST-to-SST interaction:
+  - the same SetMode build path calls `SetMode_ApplyMstToSstOptimizationSignalCoercion()` before path-state construction;
+  - the optimization is gated by path timing/payload bit `7` at `path_entry+0x18 -> +0x1C`;
+  - when that bit is clear on the anchor path, Windows sets a DisplayObject coerce flag through vfunc `+0x318`, making `DisplayPortMst` signal type `12` report as DisplayPort type `11` to downstream mode-gate code;
+  - the later path-state builder can then mark non-anchor paths with `0x100000` skip-enable and `0x80000` force-disable/optimization flags;
+  - this is still compatible with including those paths in the complete stream list and SyncManager/HWSync pairing.
+- Interpretation:
+  - Windows' 5K path is now a more specific recipe:
+    1. normalize/coerce the internal DP-MST-style object when MST-to-SST optimization applies;
+    2. build both SetMode path states;
+    3. mark exactly one timing-server anchor with path-state bit `0x8000`;
+    4. verify compatible timing payloads;
+    5. create SyncManager inter-path requests pointing clients at that local timing server;
+    6. let `SyncManager_ApplyInterPathSynchronization()` convert that state into `stream_arg+0x168 = 1`;
+    7. run HWSequence/HWSync over the full stream list;
+    8. optionally skip the later ordinary DS enable/unblank loop for the non-anchor path.
+- Kernel-facing implication:
+  - the closest Linux analogue is not "wake panel, then independently train two links";
+  - it is "construct one paired 5K commit with a primary timing-server CRTC/path and a secondary timing-client CRTC/path";
+  - Linux should log and, if possible, force the timing relationship explicitly before the first tile-pair commit;
+  - useful log points are: chosen anchor CRTC/connector, secondary client mapping, selected timing equality, tile order, whether both paths share a timing source/sync source, and whether secondary link retrain/re-enable is being suppressed after the paired commit.
+
+Extra RE continuation: tile-group anchor and timing bit7
+
+- Scope:
+  - this pass focused on two unknowns from the state-1/HWSync chain:
+    - descriptor vfunc `+0x238`, used alongside `+0x2A8` when marking path-state bit `0x8000`;
+    - timing payload bit `7` at `path_entry+0x18 -> +0x1C`, used by the MST-to-SST optimization and by split-mode setup.
+- New/updated IDA anchors:
+  - `0x141507AB0`: renamed `SetMode_FindTileGroupAnchorDisplay`;
+  - `0x14140BA40`: renamed `BuildSourceModeForTileSplitPath`.
+- Confirmed tile-group selection:
+  - `SetMode_FindMstToSstOptimizationAnchorDisplay()` delegates multi-display path lists to a manager vfunc that resolves to `SetMode_FindTileGroupAnchorDisplay()`;
+  - `SetMode_FindTileGroupAnchorDisplay()` first validates that each display index resolves to a live display object;
+  - it then calls the descriptor vfunc `+0x2C8` to read tile-group metadata;
+  - all candidates must share the same tile-group id;
+  - the number of SetMode paths must match the tile-grid size returned by that metadata;
+  - the helper tracks tile coordinates and only succeeds when every expected tile position is covered.
+- Confirmed `+0x238` role:
+  - inside a valid tile group, descriptor vfunc `+0x238` chooses the preferred anchor tile/display;
+  - if the first display in the list has `+0x238 == true`, it remains the anchor;
+  - if not, a later display with `+0x238 == true` replaces the anchor output;
+  - this is not just "is tiled" or "is connected";
+  - the best current interpretation is "preferred tile / anchor-capable tile inside the tile group";
+  - I left the vfunc itself unnamed in IDA because the concrete method name is still not proven.
+- Confirmed timing bit7 producers:
+  - `MarkTimingPipeSplitForHighResAnd5k60()` sets timing flag bit7 when the timing aspect ratio matches the display geometry within the 90%-110% window;
+  - it also marks 5120x2880@60 / high-res timings as pipe-split through `timing_record[9]` when `DalSupportMultiPipe` is enabled;
+  - `MarkModeRecordIfTileAspectCompatible()` is another producer of the same timing bit7, used when endpoint/tiled metadata is updated after pin attach;
+  - `sub_1415D5E40()` calls `MarkTimingPipeSplitForHighResAnd5k60()` while populating/inserting mode-list timings.
+- Confirmed timing bit7 consumer:
+  - `BuildSourceModeForTileSplitPath()` reads `path_entry+0x18 -> +0x1C` bit7;
+  - when set, it treats the source mode as tile-split capable;
+  - for a two-tile group it doubles the requested source width, then halves timing fields and programs each half against the two tile display objects;
+  - this gives a direct SetMode consumer for the same bit that also gates MST-to-SST optimization.
+- Confirmed SetMode path metadata:
+  - `DSDispatch_LogSetModePathList()` logs `isPathMultiPipe` and `pipeCount` for every SetMode path;
+  - `isPathMultiPipe` is read from path entry byte `+0x55`;
+  - `pipeCount` is read from path entry dword `+0x58`;
+  - this means Windows carries explicit per-path multi-pipe metadata in addition to timing bit7 and descriptor tile metadata.
+- Interpretation:
+  - Windows has two related but distinct concepts:
+    - tile group identity/coverage from descriptor vfunc `+0x2C8`;
+    - preferred timing anchor from descriptor vfunc `+0x238`;
+  - timing bit7 is the mode/timing-side permission that says the selected timing can be treated as a tiled/pipe-split mode;
+  - path-state bit `0x8000` then chooses a concrete timing-server path for SyncManager/HWSync.
+- Kernel-facing implication:
+  - Linux should not only check "two internal connectors exist";
+  - it should also validate that the two selected timings form one complete tile group and that one connector/CRTC is chosen as the timing anchor;
+  - our logs should include tile group id, tile coordinates/order, full tile coverage, selected timing dimensions, and chosen anchor;
+  - if the kernel cannot infer an anchor from EDID/display topology, a hardcoded iMac19,1 anchor policy may be needed for the first plain-boot experiment.
+
+Extra RE continuation: DisplayID tile metadata vtable proof and Apple cap rows
+
+- Scope:
+  - this pass tightened the producer/consumer proof for endpoint tile metadata and rechecked the Apple `APP/AE25` / `APP/AE26` capability rows against the current IDB;
+  - the goal was to avoid treating a notes-level assumption as proven before using it to steer the Linux plain-boot path.
+- New/updated IDA anchors:
+  - `0x144CC6C28`: renamed `DisplayId20ParserVtable`;
+  - `0x144CC70F0`: renamed `DisplayId13ParserVtable`;
+  - `0x141AEEED0`: renamed `DisplayId20_EncodeManufacturerId3Char`;
+  - `0x141AEEE70`: renamed `DisplayId20_ReadProductCode16`;
+  - `0x141AEEDD0`: renamed `DisplayId20_ReadSerialNumber32`;
+  - `0x141AFB3D0`: renamed `DisplayId13_EncodeManufacturerId3Char`;
+  - `0x141AFB370`: renamed `DisplayId13_ReadProductCode16`;
+  - `0x141AFB2D0`: renamed `DisplayId13_ReadSerialNumber32`;
+  - `0x141A20850`: renamed `WindowsDM_CopyEndpointTileMetadataByDisplayId`;
+  - `0x141ABC720`: renamed `InitMainVendorProductCapabilityTable`;
+  - `0x141A44530`: renamed `GetPinCapabilityRecordCount`.
+- Confirmed DisplayID parser vtable slot:
+  - `PopulateEndpointTileMetadataFromDisplayIdTopology()` calls the display object's active EDID/DisplayID parser vtable slot `+0x158`;
+  - for DisplayID 2.0, parser vtable slot `+0x158` at `0x144CC6D80` is `ParseDisplayId20TiledTopologyBlock40()`, which searches data-block tag `0x28`;
+  - for DisplayID 1.x, parser vtable slot `+0x158` at `0x144CC7248` is `ParseDisplayId13TiledTopologyBlock18()`, which searches data-block tag `0x12`;
+  - both parser variants fall back only to `QueryNextEdidExtensionForTiledTopology()`, meaning the next parser/extension in the same display object's chain.
+- Confirmed endpoint tile metadata copy:
+  - `WindowsDM_CopyEndpointTileMetadataByDisplayId()` is present as interface vtable slot `+0x2C8` at `0x144AF45D0` and `0x144AF6B08`;
+  - it resolves the display id through the WindowsDM display-object table;
+  - if `display_obj+0x90+0x98` has a nonzero token, it copies `0x38` bytes from `display_obj+0x90+0x98..+0xCF` to the caller;
+  - if the endpoint block is absent, it returns false; there is no peer/primary tile metadata clone here.
+- Confirmed tile group token components:
+  - the parser copies/derives manufacturer, product, and serial identity fields from the DisplayID tiled-topology payload;
+  - the manufacturer helper encodes the three-character ID into EDID/EISA-style bits;
+  - the product helper reads the 16-bit product code;
+  - the serial helper reads the 32-bit serial/unique field;
+  - `PopulateEndpointTileMetadataFromDisplayIdTopology()` combines those fields into the endpoint tile group token consumed later by grouped validation.
+- Confirmed Apple capability rows in the modern BootCamp driver:
+  - main table pointer `off_144C4E080` points at `0x144C4F720`, a 361-record table of `{EDID manufacturer, EDID product, source capability id, value}`;
+  - record `149` at `0x144C50070`: `APP/AE25`, source id `0x38`, value `0`;
+  - record `150` at `0x144C50080`: `APP/AE26`, source id `0x39`, value `0`;
+  - `MapCapabilityTableIdToPinPropertyTag()` maps source id `0x38` to pin tag `0x3A` and source id `0x39` to pin tag `0x3B`;
+  - `SetPinDescriptorCapabilityBitById()` maps tag `0x3A` to pin descriptor byte `+6` bit `2`, and tag `0x3B` to byte `+6` bit `3`.
+- Cross-check with our local Linux/OCLP evidence:
+  - the captured 5K EDID reports base EDID model `0xAE26`;
+  - its DisplayID tiled-topology block reports tiled product ID `44563` / `0xAE13`;
+  - this means the base EDID product used for the Windows vendor/product capability table is not the same field as the DisplayID tiled product ID used for the tile group token.
+- Interpretation:
+  - the Windows path has two separate identity layers:
+    - base EDID `APP/AE25` or `APP/AE26` selects Apple/tiled pin capabilities `0x3A` / `0x3B`;
+    - DisplayID tiled-topology identity builds the shared tile group token used by SetMode/grouped validation.
+  - detect/status-time `0x4F1` remains biased toward descriptor byte `+6` bit `2` / tag `0x3A`;
+  - stream-enable-time `0x4F1` accepts byte `+6` bit `2` or bit `3`, so it remains the strongest static match for an `AE26` / tag-`0x3B` secondary path;
+  - the post-bring-up `dc_sink+0x5B4` helper is weaker for `APP/AE25/AE26` because both static rows have value `0`;
+  - no static `APP/AE25` or `APP/AE26` row proves tag `0x40`, so `DPCD 0x205` should remain diagnostic/read-only unless runtime evidence proves it for the exact boot state.
+- Kernel-facing implication:
+  - Linux should log base EDID product and DisplayID tiled product separately; mixing them can make the route look inconsistent when it is not;
+  - the closest Windows-shaped behavior is still to preserve or reacquire the real secondary endpoint's EDID/DisplayID tile metadata, not to clone the primary tile's block as normal behavior;
+  - for plain boot, the important success condition is reaching a paired stream-enable equivalent with the real secondary AUX/route alive and the `APP/AE26 -> tag 0x3B` capability recognized;
+  - if a Linux fallback synthesizes TILE metadata, it should be labeled as a compatibility fallback after the secondary route was physically proven, not as behavior copied from Windows.
+
+Extra RE continuation: false-disconnect / secondary preservation path
+
+- Scope:
+  - this pass rechecked the Apple/tiled false-disconnect path in the modern BootCamp AMD driver;
+  - the goal was to distinguish three different things that are easy to blur together:
+    - the 120-byte detection result returned by the detect wrapper;
+    - the current live display object / detection-record live pointer;
+    - the lower display-map entry and per-object AUX/DPCD transport.
+- New/updated IDA anchors:
+  - `0x1414A9E90`: renamed `IsDisplayMapDetectRefcountPass`;
+  - `0x1414A9EE0`: renamed `IsDisplayMapDetectNotifyPass`;
+  - `0x1414AE400`: renamed `RetainDisplayMapEntriesForDetectPass`;
+  - `0x1414AE020`: renamed `ReleaseDisplayMapEntriesAfterDetectPass`;
+  - `0x1414B3A20`: renamed `UpdateDetectionRecordLiveDisplayObject`;
+  - `0x1414AFD20`: renamed `NotifyDetectionRecordDisconnected`;
+  - `0x1414AFD70`: renamed `NotifyDetectionRecordConnected`.
+- Confirmed detection-result layout:
+  - `DetectDisplayMainMaybeApple5k()` allocates/clears a 120-byte result buffer;
+  - result byte `+0x72` is the detected connected flag;
+  - result byte `+0x73` is a special side-path flag that bypasses the normal live-state update path;
+  - result byte `+0x70` is the changed/rescan flag consumed by `HandleDisplayDetectionResultAndLiveState()`;
+  - `ApplyDetectionResultAndUpdateLiveDisplayObject()` later passes result byte `+0x72` and result byte `+0x70` into `UpdateDisplaySinkConnectionAndLiveAuxState()`.
+- Confirmed false-disconnect gate:
+  - `DetectDisplayAndApplyApple5kOverrides()` first seeds the result from the current display object state;
+  - if `DetectDisplayEarlyExitForApple5kCaps()` does not short-circuit, the normal path runs status detection and can call the detect/status `0x4F1` path;
+  - after that normal detection, the Apple/tiled false-disconnect branch checks:
+    - connected pin descriptor byte `+6` bit `3` is set, matching the `0x3B` capability family;
+    - the current display object still reports connected through vfunc `+0x258`;
+    - the new detection result says disconnected at result byte `+0x72`;
+    - current Windows signal type is `11`, which this driver logs as DisplayPort/SST in the local signal enum.
+  - when all four are true, Windows writes:
+    - result byte `+0x72 = 1`;
+    - result byte `+0x70 = 0`.
+- Confirmed teardown avoidance:
+  - `HandleDisplayDetectionResultAndLiveState()` computes `changed = result.connected != current_connected`;
+  - after the `0x3B` correction, `changed` is false and `result+0x70` is clear;
+  - for this DP false-disconnect case, it therefore does not call `ApplyDetectionResultAndUpdateLiveDisplayObject()`;
+  - because that function is skipped, `UpdateDisplaySinkConnectionAndLiveAuxState()` is skipped;
+  - because that function is skipped, `UpdateDetectionRecordLiveDisplayObject()` is not allowed to clear the detection record's live object pointer.
+- Confirmed what the skipped clear would do:
+  - `UpdateDetectionRecordLiveDisplayObject()` finds the detection record for the current object id;
+  - when the display object reports connected, it stores the live object pointer at record `+0x18`;
+  - when the display object reports disconnected, it calls `NotifyDetectionRecordDisconnected()` and clears record `+0x18`;
+  - this is the teardown that the `0x3B` false-disconnect path avoids.
+- Confirmed lower display-map bookkeeping still exists:
+  - `RetainDisplayMapEntriesForDetectPass()` runs before the normal detect/status path;
+  - `ReleaseDisplayMapEntriesAfterDetectPass()` runs after the false-disconnect correction on the normal path;
+  - `IsDisplayMapDetectRefcountPass()` returns true for detect passes `0`, `2`, and `3`;
+  - on those passes the retain/release helpers increment/decrement display-map entry `+0x0C` and clear byte `+0x12` when the count reaches zero;
+  - this is not the same as clearing the detection-record live object pointer at record `+0x18`.
+- Interpretation:
+  - Windows does not preserve the Apple 5K secondary by keeping a fake sink after disconnect;
+  - it edits the detection result before the live-object update path can convert a transient disconnected result into object teardown;
+  - it still has lower display-map pass bookkeeping around the same detect window, so the visible mechanism is more subtle than "never release anything";
+  - the durable per-object AUX/DPCD transport remains the display-map entry path validated by `ProbeDisplayStatusMaybeAssert4F1()` from entry `+0x18/+0x20`.
+- Kernel-facing implication:
+  - the closest Linux analogue is to suppress or defer the exact false disconnect before generic detect code clears `dc_link->local_sink` or powers down the lower route;
+  - restoring a previous sink pointer after the lower route has already been invalidated is weaker than the Windows behavior;
+  - a correct quirk should require concrete proof that the real secondary `0x3113` route was live/AUX-writable earlier, then prevent the transient HPD/detect result from tearing down that real route;
+  - preserving only DRM `TILE` metadata or an emulated sink is not enough if the lower DDC/AUX backend is allowed to die.
+
+Extra RE continuation: exact secondary stream-enable conditions
+
+- Scope:
+  - this pass rechecked the modern BootCamp AMD driver's stream-enable path after the false-disconnect mechanism was clarified;
+  - the goal was to separate the exact AE26/tag-`0x3B` secondary stream-enable route from the other `0x4F1` writers that look similar but have different gates.
+- New/updated IDA anchors:
+  - `0x141B70E60`: renamed `IsDpFamilySignal32_64_128`;
+  - added `IMAC5K_RE_STREAM_COND` comments on the mode-11 gate, stream worker state branches, descriptor-bit checks, lower signal classifier, and the two weaker `0x4F1` helper routes.
+- Confirmed mode-11 immediate gate:
+  - `EnableValidatedStreamMaybeAssert4F1()` calls `UpdateMode11ImmediateStreamEnableFlag()` before deciding whether to call `StreamEnableWrite4F1AndPollSinkStatus()`;
+  - `UpdateMode11ImmediateStreamEnableFlag()` calls vtable slot `+0x160` on the display object stored at `stream_arg+0x178`;
+  - if that method returns stream mode `11`, it sets link-service byte `+0x40A`;
+  - because the wrapper receives `link_service+0x28`, the same byte appears as `a1+994` in `EnableValidatedStreamMaybeAssert4F1()`;
+  - if the method returns stream mode `12`, it clears byte `+0x40A` and resets the associated allocation/cache state if the byte had been set;
+  - only the mode-11/immediate branch calls `StreamEnableWrite4F1AndPollSinkStatus()` from this wrapper.
+- Confirmed stream-enable worker states:
+  - `StreamEnableWrite4F1AndPollSinkStatus()` uses state field `this+0x58`;
+  - state `2` or state `3` returns success immediately;
+  - state `1` is an already-link-configured pending-stream-enable path:
+    - it programs/caches the requested tuple;
+    - writes/updates DPCD `0x316`;
+    - programs stream source state;
+    - calls the real stream-enable vfunc;
+    - promotes state `1 -> 3`;
+    - returns without the later tag-gated `0x4F1` write.
+  - state `0` is the normal path:
+    - maybe clears DPCD `0x111` bit `0`;
+    - maybe verifies/retries link caps;
+    - calls `TryEnableLinkWithHbr2Fallback()`;
+    - writes/updates DPCD `0x316`;
+    - programs stream source state;
+    - calls the real stream-enable vfunc;
+    - then attempts DPCD `0x4F1 = 1` only if the descriptor gate is true;
+    - marks state `2`;
+    - polls DPCD `0x205` only if the separate tag-`0x40` gate is true.
+- Confirmed descriptor gates:
+  - the stream-enable `0x4F1` write accepts connected pin descriptor byte `+6` bit `2` or bit `3`;
+  - that means both tag `0x3A` and tag `0x3B` can reach the stream-enable latch;
+  - the `0x205` poll is separately gated by descriptor byte `+6` bit `5` / tag `0x40`;
+  - the static `APP/AE25` and `APP/AE26` rows prove tag `0x3A` / `0x3B`, not tag `0x40`, so `0x205` should stay diagnostic unless runtime evidence proves it.
+- Confirmed cached vs fresh link conditions:
+  - `LinkServiceHasCachedLinkSettings()` is only a cached-tuple presence check: dword `link_service+0x8C != 0`;
+  - `TryEnableLinkWithHbr2Fallback()` compares the requested tuple dword0/dword1 against cached `+0x8C/+0x90`;
+  - if they match, it returns link-enable success without fresh training;
+  - if they do not match, it disables/reprograms and calls the ASSR/training path;
+  - state `1` is stricter than cached tuple presence: `SetState1IfDpcdReportsTrainedLink()` calls `RecoverActiveDpLinkSettingsFromDpcd()` and only arms state `1` if DPCD `0x100/0x101` plus lane status `0x202/0x203` prove a live trained link.
+- Confirmed other `0x4F1` routes are weaker for AE26 secondary bring-up:
+  - `WindowsDM_EnableSecondaryTileIfRequired()` checks descriptor byte `+6` bit `2` or bit `3`, but then additionally requires lower display/link type `128` before calling `SendSecondaryTileOpcode1265Payload1()`;
+  - this looks like the eDP/root helper, not the whole signal-`32` AE26 secondary path;
+  - `BringUpDisplayBySignalType()` has a post-success helper that can call `SendSecondaryTileOpcode1265Payload1()` after lower bring-up, but it is gated by lower display object flag/value `+0x5B4`;
+  - the static `APP/AE25` and `APP/AE26` table rows have value `0`, so this post-bring-up helper is weaker evidence than the stream-enable worker for our panel.
+- Lower bring-up relationship:
+  - `IsDpFamilySignal32_64_128()` returns true exactly for signal types `32`, `64`, and `128`;
+  - in `BringUpDisplayBySignalType()`, signal `32` reaches `BringUpDpOrEdpWithLinkTraining()`, signal `64` takes the MST pre-enable path, and signal `128` takes the eDP/root path;
+  - `BringUpDpOrEdpWithLinkTraining()` publishes DP source-DPCD `0x300/0x303/0x310` before link training;
+  - therefore the stream-enable path assumes lower DP source-DPCD setup and training have already happened. It is not the place where the whole secondary AUX/backend route is created from zero.
+- Kernel-facing implication:
+  - the false-disconnect preservation path is now clear enough to move on from: Linux should prevent teardown of a physically proven secondary route before generic detect clears it;
+  - the exact Windows-shaped secondary stream-enable checklist is:
+    - real secondary object survives detect;
+    - stream object resolves through `stream_arg+0x178`;
+    - stream mode is `11`, arming link-service byte `+0x40A`;
+    - the worker is not already state `2` or `3`;
+    - state `1` is allowed only with live trained-link DPCD proof; otherwise state `0` runs normal cached-or-fresh link enable;
+    - source/stream state is programmed and the real stream-enable vfunc runs;
+    - only then does tag `0x3A` or tag `0x3B` permit DPCD `0x4F1 = 1`;
+    - `0x205` polling is not part of the AE26/tag-`0x3B` requirement unless tag `0x40` appears at runtime.
+  - for Linux testing, the next high-signal logs should capture whether the secondary route reaches the stream-enable equivalent with:
+    - live trained-link proof (`0x100/0x101`, `0x202/0x203`);
+    - source-DPCD `0x300/0x303/0x310` already programmed;
+    - selected stream/tile mode equivalent to Windows mode `11`;
+    - recognized `APP/AE26 -> tag 0x3B` capability;
+    - 0x4F1 attempted only after stream/source programming, not as the first wake operation.
+
+Extra RE continuation: secondary source-DPCD / training sequence
+
+- Scope:
+  - this pass rechecked the lower DP source-DPCD and training loops in the modern BootCamp AMD driver;
+  - the goal was to distinguish lower initial bring-up from later DisplayPortLinkService fresh-training, because they share concepts but not exact DPCD write order.
+- New/updated IDA anchors:
+  - `0x1414DB6C0`: renamed `TrainClockRecoveryLoop`;
+  - `0x1414DABC0`: renamed `TrainChannelEqualizationLoop`;
+  - `0x1414DC080`: renamed `ReadLaneStatusAndAdjustRequests`;
+  - `0x1414DD300`: renamed `DpcdSetLaneSettingsOnly`;
+  - `0x1414DCD60`: renamed `MapTrainingPatternIdToDpcdValue`;
+  - `0x141B87D70`: renamed `LowerPerformDpLinkTraining`;
+  - `0x141B8B9D0`: renamed `LowerDpcdSetLinkSettings`;
+  - `0x141B898D0`: renamed `LowerTrainClockRecoverySequence`;
+  - `0x141B89C60`: renamed `LowerTrainChannelEqualizationSequence`;
+  - `0x141B8A7D0`: renamed `LowerReadLaneStatusAndAdjustRequests`;
+  - `0x141B8B200`: renamed `LowerDpcdSetLtPatternAndLaneSettings`;
+  - `0x141B8A2F0`: renamed `LowerDpcdSetLaneSettingsOnly`;
+  - `0x141B8C0E0`: renamed `LowerWaitTrainingAuxRdInterval`.
+- Confirmed lower initial bring-up order:
+  - `BringUpDisplayBySignalType()` routes signal `32` to `BringUpDpOrEdpWithLinkTraining()`;
+  - `BringUpDpOrEdpWithLinkTraining()` order remains:
+    - optional DPCD `0x111` bit0 only for signal `32` plus link-rate class `2`;
+    - type-`128` HPD/AUX callbacks only for signal/display type `128`;
+    - `ProgramDpPreTrainingAuxState()`;
+    - `PerformLinkTrainingWithRetries()`;
+    - optional post-training cleanup/state writes such as `0x32F`.
+  - therefore the iMac secondary `0x3113` / signal-`32` route should not be treated as if it automatically receives the type-`128` HPD/AUX re-arm callbacks.
+- Confirmed source-DPCD ownership:
+  - `ProgramDpPreTrainingAuxState()` is the lower owner of source-DPCD publication before training;
+  - it writes:
+    - DPCD `0x300`: source OUI, payload `00 00 1A` when the existing OUI is not already AMD/ATI;
+    - DPCD `0x303`: 9-byte source/device descriptor block;
+    - DPCD `0x310`: source table revision, normally `04 1D 03` for the DCE path we mapped;
+    - optional DPCD `0x340`: AMD minimum-hblank byte when the runtime field is nonzero.
+  - a separate cached-block branch can write 12 bytes starting at `0x300`, but that covers `0x300..0x30B`; it does not cover `0x310`;
+  - this supports the current Linux direction: keep `0x310` publication adjacent to the lower source-DPCD path, not only in the higher DM grouped-view hook.
+- Confirmed lower training retry order:
+  - `PerformLinkTrainingWithRetries()` runs up to the caller-provided retry count;
+  - before each attempt it calls `PrepareLinkTrainingStateAndArmEdp128()`;
+  - `PrepareLinkTrainingStateAndArmEdp128()` repeats HPD/AUX arm callbacks only when lower signal/type is `128`;
+  - it writes DP_SET_POWER / DPCD `0x600` D0 after source-side training state is prepared;
+  - a failed attempt calls `DisableDpLinkMaybeD3PowerOff()` before retry;
+  - a successful attempt returns before the D3/disable cleanup.
+- Confirmed lower link-setting write order:
+  - `LowerDpcdSetLinkSettings()` is the lower training implementation's link-setting writer;
+  - for the ordinary 8b/10b path it writes:
+    - DPCD `0x107` spread/downspread first;
+    - DPCD `0x101` lane count second;
+    - DPCD `0x100` link rate third.
+  - there is a separate branch for newer/link-specific cases that writes `0x100 = 0` and then `0x115`;
+  - this differs from the later DisplayPortLinkService fresh-training helper `DpcdSetLinkSettingsWrite100101Then107()`, which writes `0x100/0x101` as a two-byte transfer and only then writes `0x107`.
+- Confirmed lower CR/EQ loop:
+  - `LowerPerformDpLinkTraining()` dispatches to `LowerTrainClockRecoverySequence()` and `LowerTrainChannelEqualizationSequence()` for link-rate class `1`;
+  - `LowerDpcdSetLtPatternAndLaneSettings()` writes DPCD `0x102` training pattern plus lane settings at `0x103..` as one block unless split-write behavior is selected;
+  - `LowerDpcdSetLaneSettingsOnly()` writes subsequent lane settings at `0x103..` after adjust requests change drive settings;
+  - `LowerReadLaneStatusAndAdjustRequests()` reads DPCD `0x202..0x207` and extracts lane status plus adjust request bytes;
+  - clock recovery loops until success, 100 total iterations, or five same-drive attempts;
+  - channel equalization loops up to six iterations and requires CR, channel EQ, symbol lock, and interlane alignment.
+- Confirmed later DisplayPortLinkService fresh-training path:
+  - `TryEnableLinkWithHbr2Fallback()` only calls this path on cached tuple mismatch/absence;
+  - `ProgramAssrThenTrainLinkSettings()` order is:
+    - `ProgramRequestedLinkSettingsAndCache()`;
+    - `ClassifyDpPanelModeForAssrPolicy()`;
+    - `ProgramDpcd10A_AssrBitForPanelMode()`;
+    - `TrainLinkWithAssrRetryOnceOnStatus6()`;
+    - `PerformLinkTrainingWithAssrPatternPolicy()`.
+  - this path writes ASSR DPCD `0x10A` before training;
+  - it also passes the same ASSR/panel policy into PHY/training-pattern requests through `SetDpPhyPatternWithAssrPolicy()`;
+  - it does not republish source-DPCD `0x300/0x303/0x310`; it assumes lower source-DPCD publication already happened.
+- Interpretation:
+  - Windows has two relevant training layers:
+    - lower initial bring-up: source-DPCD owner, lower link-setting writer, lower CR/EQ loops;
+    - later DisplayPortLinkService fresh training: cached/fresh decision, ASSR `0x10A`, ASSR-aware PHY/training-pattern policy, CR/EQ loops.
+  - the iMac secondary route likely needs both pieces when it cannot use cached handoff:
+    - lower source-DPCD must be published before any destructive training writes;
+    - ASSR/panel policy must be visible before and during training;
+    - if the preserved tuple is valid and matches, Windows can avoid fresh training entirely through the cached path.
+- Kernel-facing implication:
+  - do not use source-DPCD `0x310` readback as the only readiness proof; previous Linux tests showed successful lower writes can still read back as zeros on this sink;
+  - do require write-success/evidence that the lower source-DPCD path ran before link-setting writes;
+  - do not copy the type-`128` HPD/AUX arm callbacks into the signal-`32` secondary path without stronger evidence;
+  - the next useful Linux logs should show, for the exact secondary `0x3113` route:
+    - whether lower source-DPCD publication occurs before any `0x107/0x101/0x100` or `0x100/0x101/0x107` link-setting writes;
+    - whether `DP_PANEL_MODE_EDP` / ASSR policy reaches both DPCD `0x10A` and training-pattern/PHY programming;
+    - whether the first two-tile commit is using cached handoff or fresh training;
+    - if fresh training happens, the exact first failing stage: `0x100/0x101/0x107`, `0x102/0x103`, `0x202..0x207`, or post-failure D3 cleanup.
+
+Extra RE continuation: mode-11 source and MST-to-SST coercion gate
+
+- Scope:
+  - this pass rechecked the exact source of the stream mode `11` gate used by `UpdateMode11ImmediateStreamEnableFlag()`;
+  - the goal was to connect the stream-enable decision back to the SetMode MST-to-SST optimization instead of treating mode `11` as an unexplained display-object result.
+- New/updated IDA comments:
+  - added `IMAC5K_RE_MODE11_SOURCE` comments on:
+    - `DisplayObject_GetCommittedSignalTypeForModeGate()`;
+    - `DisplayObject_SetSignal12ReportsAs11Flag()`;
+    - `SetMode_ApplyMstToSstOptimizationSignalCoercion()`;
+    - `DSDispatch_SetMode()`;
+    - `DSDispatch_BuildApplySetModePaths()`;
+    - tile-group anchor selection;
+    - HWSync source-signal adjustment.
+- Confirmed mode-gate field:
+  - `DisplayObject_GetCommittedSignalTypeForModeGate()` reads the committed signal type from display interface `+0x48`;
+  - if display interface byte `+0x1E9` is set and the committed type is `12`, it returns `11`;
+  - otherwise it returns the committed type unchanged;
+  - therefore the stream-enable mode-`11` gate can be reached either by a naturally committed type `11`, or by committed type `12` plus byte `+0x1E9`.
+- Confirmed setter:
+  - `DisplayObject_SetSignal12ReportsAs11Flag()` is the vtable slot `+0x318` setter for byte `+0x1E9`;
+  - it only writes that byte and returns;
+  - xrefs show this function is installed through the display-object vtable; direct callers reach it virtually.
+- Confirmed SetMode producer:
+  - `DSDispatch_SetMode()` calls `SetMode_ApplyMstToSstOptimizationSignalCoercion()` before building/applying the SetMode path state;
+  - `DSDispatch_BuildApplySetModePaths()` calls the same helper again while building path-state records;
+  - if the helper succeeds, the path builder also marks affected paths with the MST-to-SST optimization / force-disable metadata.
+- Confirmed optimization gate:
+  - `SetMode_ApplyMstToSstOptimizationSignalCoercion()` first requires `SetMode_AllDisplaysHaveAtMostTwoTiles()`;
+  - it finds an MST-to-SST optimization anchor display;
+  - it then reads anchor path timing/payload bit `7` at `path_entry+0x18 -> +0x1C`;
+  - if anchor bit `7` is clear, it calls display-object vfunc `+0x318(1)` for each path display, setting byte `+0x1E9`;
+  - if anchor bit `7` is set, it calls vfunc `+0x318(0)`, clearing byte `+0x1E9`.
+- Confirmed anchor/tile relationship:
+  - multi-display anchor selection goes through the tile-group anchor helper;
+  - that helper validates live display objects, common tile-group id, full tile-grid coverage, and preferred anchor flag from descriptor vfunc `+0x238`;
+  - this ties the mode-`11` coercion to the valid tiled SetMode group, not merely to "two connectors exist".
+- Confirmed HWSync is separate:
+  - `HWSync_AdjustDpMstEdpSourceSignalForInterPath()` can write source-side signal type `8` for DP-MST/eDP peers through a source-object vfunc;
+  - that is HWSync/source state and is separate from display-object byte `+0x1E9`;
+  - it does not explain the `UpdateMode11ImmediateStreamEnableFlag()` result by itself.
+- Interpretation:
+  - the mode-`11` immediate stream-enable branch is a Windows SetMode-owned state, not a firmware-only artifact;
+  - for a type-`12` DisplayPortMST-style object, the branch is enabled when MST-to-SST optimization sets byte `+0x1E9`;
+  - that optimization is gated by a valid tiled path list, anchor selection, and selected timing/path metadata.
+- Kernel-facing implication:
+  - Linux should not only preserve the secondary AUX/link and TILE metadata;
+  - it also needs the atomic commit to be recognized as a paired tiled SetMode equivalent before expecting Windows-like mode-`11` stream behavior;
+  - useful next logs are:
+    - whether the first 5K commit has both tile paths in one grouped atomic state;
+    - which path is chosen as timing anchor;
+    - whether selected timing/path metadata corresponds to Windows' bit-`7` tiled/split-mode gate;
+    - whether the secondary is being treated as a mode-`11`/SST stream equivalent or left in a mode-`12`/MST-like path that would clear the immediate stream-enable flag.
+
+Extra RE continuation: object `0x3113` route construction and lifetime
+
+- Scope:
+  - this pass rechecked how the modern BootCamp AMD driver constructs the secondary route from the object table, how the DPCD/AUX backend is attached, and which later lifetime paths touch the display-map entry versus the detection record;
+  - the goal was to make Stage 2 plain-boot Linux less vague: either Linux must discover the same real `0x3113` route, or it must construct an equivalent physical route early enough for normal detect/training/stream code to use it.
+- New/updated IDA anchors:
+  - `0x1414B5AE0`: renamed `BuildStreamsForDisplayObjectBySignalType`;
+  - `0x1414AC570`: renamed `ReleaseStreamsForDisplayMapEntry`;
+  - `0x1414B7810`: renamed `AttachChildInterfacesToDisplayObjectPath`;
+  - added `IMAC5K_RE_3113_ROUTE` comments on:
+    - `PopulateDisplayMapAuxObjectsForHotplugRange()`;
+    - `CreateDpcdAuxInterfaceForObjectId()`;
+    - `ConstructDpcdAuxInterfaceForObjectId()`;
+    - `BuildStreamForDisplayEntryPath()`;
+    - `BuildStreamsForDisplayObjectBySignalType()`;
+    - `ConstructDpStreamObjectWithDpcdInterface()`;
+    - `AttachStreamInterfaceToDisplayEntry()`;
+    - `AddDisplayObjectToDetectionRecord()`;
+    - `MarkDisplayMapEntryLive()`;
+    - `DecrementDisplayMapEntryRefAndClearLiveByte()`.
+- Confirmed construction path:
+  - `ConstructDisplayTopologyManager()` calls `PopulateDisplayMapAuxObjectsForHotplugRange()`;
+  - that function iterates firmware/object-table display object ids through the adapter provider, creates a display-map interface for each candidate object id, inserts a 64-byte display-map entry, and only then creates the object-specific DPCD/AUX interface;
+  - `0x3113` passes the class-3 filter in `CreateDisplayMapInterfaceForObjectIdMaybeSkipInternal()`;
+  - the property13 bit17 skip policy can drop low-byte `0x14` or `0x0E`, but it does not drop low-byte `0x13`, so the secondary `0x3113` route is intentionally allowed through this constructor path.
+- Confirmed DPCD/AUX attachment:
+  - `PopulateDisplayMapAuxObjectsForHotplugRange()` stores `CreateDpcdAuxInterfaceForObjectId()` at display-map entry `+0x18`;
+  - `CreateDpcdAuxInterfaceForObjectId()` is only called from this object-table population path in the current IDB;
+  - `ConstructDpcdAuxInterfaceForObjectId()` obtains the lower AUX handle through AdapterService vfunc `+0x170`;
+  - AdapterService vfunc `+0x170` is `AdapterServiceGetAuxHandleForObjectId()`, which queries the exact object descriptor and passes descriptor selector/source-mask data into the AUX factory;
+  - for secondary `0x3113`, the descriptor selector is `0x4871`, which `Dce11ResolveAuxSelectorToPinIndex()` maps to AUX pin index `2`;
+  - the dual-pin AUX transaction handle then requires the lower pin-graph endpoints for type `3` and type `4`, matching the DDC/AUX data/clock backend for that pin.
+- Confirmed `0x3113` DPCD-interface policy:
+  - `ConstructDpcdAuxInterfaceForObjectId()` defaults `DPDelay4I2CoverAUXDEFER` to true when the class-3 object low byte is `0x13`;
+  - the same constructor sets byte `+0x88C` only for low-byte `0x14` or `0x0E`, not for `0x13`;
+  - so Windows treats `0x3113` as a real DP-family object with a special AUX defer delay, not as the same eDP/internal bucket used by low-byte `0x14`.
+- Confirmed stream construction from the route:
+  - after entry `+0x18` is populated, `ExpandDisplayPathAndConstructStreams()` recursively expands child/transport objects and eventually calls `ConstructDisplayObjectAndStreams()`;
+  - `BuildStreamForDisplayEntryPath()` builds the stream init block from the display-map path and passes the display-map entry `+0x18` DPCD/AUX object through init offset `+0x18`;
+  - `ConstructDpStreamObjectWithDpcdInterface()` stores that init offset at stream object `+0xB8`, so the resulting DP stream carries the same object-specific DPCD/AUX backend forward;
+  - `AttachStreamInterfaceToDisplayEntry()` records stream interfaces in the display-map stream table. This makes the created stream interfaces durable table entries, not only local temporary allocations.
+- Confirmed `0x3113` special stream-shape:
+  - `BuildStreamsForDisplayObjectBySignalType()` has an explicit class-3 low-byte `0x13` branch when the display object's per-stream signal/type is `0x0B`;
+  - on that branch Windows calls:
+    - `BuildStreamForDisplayEntryPath(..., kind 3)`;
+    - `BuildStreamForDisplayEntryPath(..., kind 2)`;
+    - then `BuildStreamForDisplayEntryPath(..., kind 1)`.
+  - the kind `3` and kind `2` results are attached through the stream table as side effects, while the kind `1` stream is stored back on the display object through the normal vfunc `+0x468` setter;
+  - this is a concrete Windows lifetime detail we had not written down before: the secondary `0x3113` route can have more stream-interface state than just the one final DP stream pointer.
+- Confirmed display-map liveness:
+  - successful display-object construction calls `MarkDisplayMapEntryLive()` for the main display interface and for each stream/path peer interface;
+  - `MarkDisplayMapEntryLive()` sets display-map entry byte `+0x10` and byte `+0x11`;
+  - if the entry was already live, it ORs bit0 into the interface flags before re-marking it live;
+  - this is separate from the 104-byte detection-record live object pointer at record `+0x18`.
+- Confirmed detection-record relationship:
+  - `ConstructDisplayObjectRecordTable()` allocates one 104-byte record per display object id from the provider;
+  - `AddDisplayObjectToDetectionRecord()` stores up to two candidate display objects at record `+0x20`, with candidate count at record `+0x30`;
+  - if the record's base/display interface has class-3 low byte `0x13`, it sets record byte `+0x13 = 1` and clears byte `+0x12 = 0` before candidate insertion/timer scheduling;
+  - `UpdateDetectionRecordLiveDisplayObject()` later writes the currently connected display object to record `+0x18`, or clears record `+0x18` on a reported disconnect;
+  - the previously traced `0x3B` false-disconnect override prevents that clear by editing the detection result before this updater runs.
+- Confirmed what detect-pass release does and does not do:
+  - `RetainDisplayMapEntriesForDetectPass()` increments display-map entry `+0x0C` for detect passes `0`, `2`, and `3`;
+  - `ReleaseDisplayMapEntriesAfterDetectPass()` calls `DecrementDisplayMapEntryRefAndClearLiveByte()`;
+  - that helper decrements entry `+0x0C` and clears byte `+0x12` when the count reaches zero;
+  - it does not clear display-map entry `+0x18`, and it is not the same operation as clearing detection-record record `+0x18`.
+- Interpretation:
+  - Windows' `0x3113` route is object-table driven, not EDID/TILE-synthesized;
+  - the critical physical chain is:
+    - object id `0x3113`;
+    - class-3 display-map interface accepted;
+    - display-map entry inserted;
+    - entry `+0x18` DPCD/AUX wrapper created;
+    - AdapterService exact-object descriptor queried;
+    - selector `0x4871` resolved to AUX pin index `2`;
+    - dual pin endpoints type `3` and type `4` opened;
+    - display/stream objects constructed from that route;
+    - low-byte `0x13` stream side-interfaces attached;
+    - display-map entries marked present/live;
+    - detection record candidates/live pointer updated separately.
+  - the route lifetime has at least three layers that must not be conflated:
+    - display-map entry and its object-specific DPCD/AUX transport at entry `+0x18`;
+    - stream-interface table entries attached from that display-map path;
+    - detection-record candidate/live pointers in the 104-byte record table.
+- Kernel-facing implication:
+  - Stage 2 Linux should first log whether plain boot enumerates an AMD/VBIOS/object-table route equivalent to `0x3113` with DDC3/AUX pin index `2` and the expected transmitter/encoder pairing;
+  - if `0x3113` is present but entry/AUX creation fails, the target is the AUX factory/backend path, not TILE metadata;
+  - if entry/AUX creation succeeds but the route is later lost, the target is display-map/detect/stream lifetime preservation;
+  - if `0x3113` is absent from plain boot enumeration, the kernel quirk must expose or construct the real physical secondary route before normal detection, rather than faking a second tile after detect;
+  - useful Linux logs should mirror the Windows layers:
+    - raw object id / low byte;
+    - DDC line or AUX hw instance;
+    - transmitter/encoder;
+    - HPD source;
+    - whether the route matches secondary `0x3113` / DDC3 / UNIPHY_D;
+    - whether the DPCD/AUX backend exists before detect;
+    - whether stream construction creates one or multiple stream-interface records;
+    - exactly which later transition clears `local_sink`, powers off AUX/link, or drops the secondary stream.
+
+Extra RE continuation: provider/object enumeration gate
+
+- Scope:
+  - this pass checked the provider-side gate above `PopulateDisplayMapAuxObjectsForHotplugRange()`;
+  - the question was whether secondary `0x3113` can be created by a synthetic provider, a BootCamp policy provider, or whether it must be present in the real VBIOS/object-info enumeration before the AUX-backed display-map path runs.
+- New/updated IDA anchors:
+  - `0x1414AD690`: renamed `ResizeDisplayMapStreamTableCapacity`;
+  - `0x141466EE0`: renamed `AdapterServiceGetTotalDisplayObjectCount`;
+  - `0x1414666E0`: renamed `AdapterServiceGetDisplayObjectIdByIndex`;
+  - `0x141460A80`: renamed `AdapterServiceGetSyntheticTailObjectCount`;
+  - `0x141463C20`: renamed `AdapterServiceBuildSyntheticTailObjectId`;
+  - `0x14152C9E0`: renamed `ObjectInfoDescriptorAdapterGetDisplayObjectCount`;
+  - `0x14152C900`: renamed `ObjectInfoDescriptorAdapterGetDisplayObjectIdByIndex`;
+  - `0x14152F990`: renamed `DisplayDescriptorCapsGetObjectCount`;
+  - `0x14152F830`: renamed `DisplayDescriptorCapsBuildObjectIdByIndex`;
+  - `0x1415AE800`: renamed `VbiosParserV2GetDisplayObjectCount`;
+  - `0x1415AE6B0`: renamed `VbiosParserV2GetDisplayObjectIdByIndex`;
+  - `0x1415A8640`: renamed `VbiosParserV1GetDisplayObjectCount`;
+  - `0x1415A8450`: renamed `VbiosParserV1GetDisplayObjectIdByIndex`;
+  - added `IMAC5K_RE_ENUM_GATE` comments around the count/id-by-index calls and the VBIOS descriptor fields.
+- Confirmed non-gate:
+  - `ResizeDisplayMapStreamTableCapacity(display_map, 100)` only resizes the display-map stream table;
+  - it allocates/copies/free-replaces the table and sets capacity at `+0xB8`;
+  - it is not a 5K-vs-4K policy decision and the constant `100` is just capacity.
+- Confirmed provider ordering:
+  - `AdapterServiceGetTotalDisplayObjectCount()` returns:
+    - ObjectInfoDescriptorAdapter / VBIOS object-info count;
+    - plus DisplayDescriptorCapabilityFlags count;
+    - plus AdapterService synthetic-tail count.
+  - `AdapterServiceGetDisplayObjectIdByIndex()` resolves ids in that same order:
+    - VBIOS/object-info provider first;
+    - display-descriptor capability provider second;
+    - synthetic tail last.
+  - `PopulateDisplayMapAuxObjectsForHotplugRange()` deliberately loops only `total_count - synthetic_tail_count`;
+  - therefore the objects that receive display-map entries and object-specific DPCD/AUX backends exclude the synthetic tail.
+- Confirmed synthetic-tail contents:
+  - `AdapterServiceGetSyntheticTailObjectCount()` computes only the number of missing synthetic tail objects;
+  - DAL/register id `0x441` can override the expected tail requirement, otherwise a base/signal-provider value of `13` can request one;
+  - this affects tail count only, and that tail is subtracted before AUX population;
+  - `AdapterServiceBuildSyntheticTailObjectId()` produces:
+    - family `0`: class `3`, type/low-byte `0x18`, instance `1..7`;
+    - family `1`: class `2`, type/low-byte `0x26`, instance `1..7`.
+  - it cannot produce class-3 low-byte `0x13`, so synthetic enumeration is not the source of secondary `0x3113`.
+- Confirmed display-descriptor capability provider contents:
+  - `DisplayDescriptorCapsGetObjectCount()` returns up to two objects depending on capability bytes at `+0x30..+0x32`;
+  - `DisplayDescriptorCapsBuildObjectIdByIndex()` produces:
+    - class `3`, type/low-byte `0x16`, instance `1`;
+    - optionally class `3`, type/low-byte `0x17`, instance `1`.
+  - this provider also cannot publish `0x3113`.
+- Confirmed ObjectInfoDescriptorAdapter role:
+  - `ConstructObjectInfoDescriptorAdapter()` is a thin wrapper around the VBIOS object-info parser;
+  - its count and id-by-index vfuncs delegate directly to the parser at object field `+0x30`;
+  - because the capability provider and synthetic tail cannot produce `0x3113`, an AUX-backed secondary `0x3113` must come from this VBIOS/object-info provider.
+- Confirmed VBIOS parser gates:
+  - V2:
+    - `VbiosParserV2GetDisplayObjectCount()` returns zero if the display-base signal path reports `13`;
+    - otherwise it counts object-table entries whose object/encoder refs are both present;
+    - `VbiosParserV2GetDisplayObjectIdByIndex()` decodes the object id from the VBIOS object-table record ref.
+  - V1:
+    - `VbiosParserV1GetDisplayObjectCount()` has the same display-base signal `13` zero-count gate;
+    - otherwise it returns the object count from the V1 object table;
+    - `VbiosParserV1GetDisplayObjectIdByIndex()` decodes object ids from the V1 object-table record ref.
+- Confirmed descriptor source:
+  - V2 descriptor parse fills descriptor field `+0x1C` from the GPIO/AUX selector table;
+  - V2 descriptor parse fills descriptor field `+0x3C` with the source/index byte;
+  - `AdapterServiceGetAuxHandleForObjectId()` later consumes those fields to build the object-specific AUX path;
+  - this means the `0x3113 -> selector 0x4871 -> AUX pin 2` chain is VBIOS/object-table descriptor data, not a runtime synthetic object.
+- Interpretation:
+  - for a durable Windows-like secondary route, the decisive question is not "did the driver synthesize a second object?";
+  - it is whether the real VBIOS/object-info provider exposes class-3 low-byte `0x13` before `PopulateDisplayMapAuxObjectsForHotplugRange()` runs;
+  - if the parser is in the display-base signal `13` zero-count state, the VBIOS object list can be suppressed before `0x3113` ever reaches display-map/AUX construction;
+  - if the VBIOS object list does expose `0x3113`, the later property13 bit17 skip does not filter it, and it should proceed toward the AUX factory path.
+- Kernel-facing implication:
+  - Linux logging should distinguish three cases early:
+    - real VBIOS/object-info `0x3113` object exists and has descriptor/AUX data;
+    - only synthetic/capability-tail objects exist, which is not enough for the secondary tile;
+    - VBIOS object-info enumeration is zeroed or missing because the display-base signal path is in the `13` gate.
+  - useful plain-vs-OCLP/BootCamp probes:
+    - base-pin signal type and display-base signal return value;
+    - VBIOS object-info table version and raw object count;
+    - per-index object id and provider source before subtracting synthetic tail;
+    - synthetic tail count and DAL/register `0x441` value;
+    - property6 bit4, because it suppresses AUX factory creation;
+    - property13 flags, especially bit17, even though it does not filter `0x3113`;
+    - for `0x3113`, descriptor selector/source fields and whether the AUX handle resolves to the expected DDC3/AUX pin.
+
+Extra RE continuation: base-pin signal `13` gate
+
+- Scope:
+  - this pass followed the zero-count gate inside `VbiosParserV1/V2GetDisplayObjectCount()`;
+  - the key question was what "display-base signal returns `13`" really means and whether it is separate from the AUX-suppression path.
+- New/updated IDA anchors:
+  - `0x14152DCD0`: renamed `CBasePinGetSignalType`;
+  - `0x141467250`: renamed `AdapterServiceInterfaceGetBasePinSignalType`;
+  - added `IMAC5K_RE_SIGNAL13_GATE` comments on:
+    - `VbiosParserV1/V2GetDisplayObjectCount()`;
+    - `ConstructVbiosObjectInfoParserV2()`;
+    - `AdapterServiceInterfaceGetBasePinSignalType()`;
+    - `AdapterServiceGetBasePinSignalType()`;
+    - `CBasePinGetSignalType()`;
+    - `ConstructDfpCapabilityNameType82()`;
+    - `ConstructDfpCapabilityNameType8D()`.
+- Confirmed gate identity:
+  - `VbiosParserV2GetDisplayObjectCount()` calls the parser-stored AdapterService interface;
+  - the vfunc slot is AdapterService `+0x28`, implemented by `AdapterServiceInterfaceGetBasePinSignalType()`;
+  - that thunk calls `AdapterServiceGetBasePinSignalType()`;
+  - `AdapterServiceGetBasePinSignalType()` delegates to `CBasePinGetSignalType()`.
+  - Therefore the VBIOS parser zero-count gate is directly the CBasePin/base-pin signal type, not a separate display-object policy layer.
+- Confirmed `CBasePinGetSignalType()` mapping:
+  - it reads capability property index `2` from the pin capability-name object;
+  - property `2 == 274` maps to driver signal type `11`;
+  - property `2 == 288` maps to driver signal type `12`;
+  - otherwise, if base-pin property `6` bit `4` is set, it maps to signal type `13`;
+  - otherwise it returns `0`.
+- Confirmed capability constructors force the `13` fallback:
+  - `ConstructDfpCapabilityNameType82()` normally writes property `2 = 274`;
+  - if property6 bit4 is set, the same constructor writes property `2 = 240` instead;
+  - `ConstructDfpCapabilityNameType8D()` normally writes property `2 = 288`;
+  - if property6 bit4 is set, the same constructor writes property `2 = 240` instead;
+  - because `240` is neither `274` nor `288`, `CBasePinGetSignalType()` falls through to the property6-bit4 branch and returns `13`.
+- Confirmed double effect of property6 bit4:
+  - in `InitializeAdapterServiceForConnector()`, property6 bit4 suppresses creation of the AUX transaction factory at AdapterService `+0x1A8`;
+  - in `CBasePinGetSignalType()`, the same property6 bit4 produces base-pin signal type `13`;
+  - VBIOS parser V1 and V2 then return zero display objects when that signal type is `13`;
+  - VBIOS parser V2 also skips `VBiosHelper` creation when the constructor signal argument is `13`.
+- Raw source chain:
+  - `InitializeDalFromKmdAdapter()` builds the DAL init structure;
+  - it passes display-interface field `+0x140` as the `adapter_init_source`;
+  - inside `PopulateDalAdapterInitSourceFlags()`:
+    - display-interface `+0x1AC` is `adapter_init_source+0x6C`;
+    - display-interface `+0x1B0` is `adapter_init_source+0x70`;
+    - `+0x6C` and `+0x70` are zeroed and then synthesized from KMD adapter, core/hardware, and DAL feature predicates.
+- Property6 bit4 raw source:
+  - `TranslateRawDceFlagsToPinProperty6()` maps raw `adapter_init_source+0x6C` bit `0x100000` to base-pin property6 bit4 / `0x10`;
+  - `PopulateDalAdapterInitSourceFlags()` can set raw `+0x6C` bit `0x100000` through multiple paths:
+    - core/hardware predicate vfunc `+0x220` plus feature-object test id `300` sets mask `0x100000`;
+    - feature-object test id `300` plus core/hardware predicate vfunc `+0x2F8` sets mask `0x140000`;
+    - feature-object vfunc `+0x520` sets mask `0x940000`.
+  - all three masks include raw `0x100000`, so all three can trigger the property6 bit4 double gate.
+- Property13 bit17 remains a different policy bit:
+  - `TranslateRawDceFlagsToPinProperty13()` maps raw `adapter_init_source+0x70` bit `0x80000` to base-pin property13 bit17 / `0x20000`;
+  - `PopulateDalAdapterInitSourceFlags()` sets that raw bit from the local Apple/internal-display policy byte at display-interface `+0x1D0`;
+  - this is the bit that skips low-byte `0x14` / `0x0E` while leaving low-byte `0x13` alone;
+  - it does not explain VBIOS object-count suppression by itself.
+- Interpretation:
+  - property6 bit4 is the hard "secondary route cannot be built normally" gate:
+    - it disables the lower AUX factory;
+    - it changes the base-pin signal to `13`;
+    - it causes the VBIOS object-info parser to enumerate zero objects.
+  - property13 bit17 is a softer Apple/internal display policy:
+    - it changes which internal class-3 objects are skipped;
+    - it preserves `0x3113` from that skip path;
+    - it participates in detect scheduling;
+    - it does not suppress VBIOS enumeration or AUX factory creation.
+- Kernel-facing implication:
+  - the first Linux plain-boot question should be whether the equivalent of property6 bit4 is effectively active:
+    - if active, Linux may see no real secondary object-table route and no valid AUX backend;
+    - if inactive, `0x3113` should be able to come from the VBIOS/object-info table and proceed toward DDC3/AUX pin creation.
+  - the most useful instrumentation remains:
+    - raw ATOM/VBIOS connector object ids and encoder refs;
+    - whether connector `0x3113` is counted before link creation;
+    - DDC/AUX line mapping for `0x3113`;
+    - whether Linux suppresses or fails lower DDC/AUX construction for that route;
+    - whether a platform quirk should force the property6-bit4 outcome to "clear" for the iMac 5K internal pair before normal connector enumeration.
+
+Extra RE continuation: property6 raw `0x100000` sources
+
+- Scope:
+  - this pass stayed on the hard property6 bit4 gate;
+  - the goal was to separate static feature-table lookup from the runtime adapter capability predicates that actually set raw `adapter_init_source+0x6C` bit `0x100000`.
+- New/updated IDA anchors:
+  - `0x1400239C0`: renamed `LookupStaticFeatureTableValueById`;
+  - added `IMAC5K_RE_PROP6_SOURCE` comments on:
+    - `LookupStaticFeatureTableValueById()`;
+    - the `adapter->vfunc+0x38` runtime capability-object getter inside `PopulateDalAdapterInitSourceFlags()`;
+    - the three property6 raw-bit source branches at `0x14019F5D0..0x14019F663`;
+    - `sub_140015910()`, where feature id `300` appears as an inhibitor for a separate feature-`298` path.
+- Confirmed static feature-table layout:
+  - `LookupStaticFeatureTableValueById(table, id, optional_byte_out)` reads:
+    - table `+0x30`: entry count;
+    - table `+0x38`: pointer array start;
+    - entry `+0x20`: feature id;
+    - entry `+0x30`: returned value;
+    - entry `+0x44`: optional byte returned to caller;
+    - entry `+0x4C`: enabled byte.
+  - this helper is used for the stack/init feature table passed as `a3`;
+  - it is separate from the runtime capability object returned by adapter vfunc `+0x38`.
+- Confirmed runtime capability-object source:
+  - `PopulateDalAdapterInitSourceFlags()` calls adapter vfunc `+0x38` once at entry and stores the result in `v8/r14`;
+  - that object is then used for runtime virtual predicates:
+    - vfunc `+0x8(feature_id)`;
+    - vfunc `+0x4D8()`;
+    - vfunc `+0x520()`;
+    - and other hardware/capability predicates.
+- Confirmed exact property6-bit4 source branches:
+  - Branch A:
+    - display/core object from `DisplayInterface+0x10` via `sub_140021950()` calls vfunc `+0x220()`;
+    - runtime capability object calls vfunc `+0x8(300)`;
+    - if both are true, Windows ORs raw `0x100000` into `adapter_init_source+0x6C`.
+  - Branch B:
+    - runtime capability object calls vfunc `+0x8(300)`;
+    - display/core object calls vfunc `+0x2F8()`;
+    - if both are true, Windows ORs raw `0x140000` into `adapter_init_source+0x6C`.
+    - this includes raw `0x100000`, so it also becomes property6 bit4.
+  - Branch C:
+    - runtime capability object calls vfunc `+0x520()` with no explicit feature-id argument;
+    - if true, Windows ORs raw `0x940000` into `adapter_init_source+0x6C`.
+    - this also includes raw `0x100000`.
+- Feature id `300` context:
+  - feature id `300` participates in two of the three hard-gate source branches;
+  - a nearby helper, `sub_140015910()`, uses feature id `300` as an inhibitor: the helper only continues into its feature-`298` path when feature `300` is false;
+  - this does not give a stable public name for feature `300`, but it argues against treating `300` as "5K enable";
+  - in the property6 source path, feature `300` is on the side that can set the hard suppressor bit.
+- Interpretation:
+  - the raw `0x100000` source is not a direct VBIOS connector-object bit and not only a static registry/override feature table value;
+  - it is synthesized from runtime adapter capability predicates plus core/hardware predicates;
+  - when it is set, the downstream effect is hostile to the route we need:
+    - property6 bit4;
+    - base-pin signal type `13`;
+    - VBIOS object-info count forced to zero;
+    - AUX transaction factory suppressed.
+- Kernel-facing implication:
+  - for the Linux plain-boot solution, the useful emulation target is the outcome "property6 bit4 clear for the internal 5K pair before object enumeration";
+  - chasing feature id `300` as an enable switch is likely the wrong direction;
+  - better logs/tests:
+    - confirm whether plain Linux has a real `0x3113` object-table connector before any tile synthesis;
+    - if missing, compare against the Windows hard-gate outcome: equivalent of raw `0x100000` should be considered active;
+    - if present but AUX fails, compare against the AUX-factory half of the same property6 gate;
+    - when implementing a quirk, model the final allowed route state directly: keep `0x3113` enumerable and keep DDC3/AUX materialization enabled.
+
+Extra RE continuation: certainty pass - property6 hard gate
+
+- Scope:
+  - this pass tightened the property6 bit4 conclusion from "likely hard gate" to a static code-chain proof for the normal Windows DAL route;
+  - the question was whether `0x3113` could still be materialized through some normal fallback path after property6 bit4 suppresses the AUX factory and forces base-pin signal type `13`.
+- New/updated IDA anchors:
+  - added `IMAC5K_RE_CERTAINTY` comments on:
+    - `AdapterServiceGetAuxHandleForObjectId()` at `0x141465B5C`;
+    - `ConstructDpcdAuxInterfaceForObjectId()` at `0x1415511A1` and `0x1415511AA`;
+    - `CreateDpcdAuxInterfaceForObjectId()` at `0x141551470`;
+    - `PopulateDisplayMapAuxObjectsForHotplugRange()` at `0x1414B8754`;
+    - `VbiosParserV2GetDisplayObjectCount()` at `0x1415AE838`;
+    - `VbiosParserV1GetDisplayObjectCount()` at `0x1415A86AD`.
+- Proven static chain:
+  - `InitializeAdapterServiceForConnector()` leaves AdapterService object `+0x1A8` / interface slot `a1[48]` null when property6 bit4 is set;
+  - the same property6 bit4 path makes `CBasePinGetSignalType()` return signal type `13`;
+  - both `VbiosParserV2GetDisplayObjectCount()` and `VbiosParserV1GetDisplayObjectCount()` return zero when base-pin signal type is `13`, so the VBIOS/object-info provider cannot expose `0x3113` through its normal object-count/id-by-index interface;
+  - `CreateDpcdAuxInterfaceForObjectId()` has one code caller in this IDB: `PopulateDisplayMapAuxObjectsForHotplugRange()` at `0x1414B8754`;
+  - `CreateDpcdAuxInterfaceForObjectId()` allocates a DPCD/AUX wrapper and discards it if the wrapper is invalid;
+  - `ConstructDpcdAuxInterfaceForObjectId()` asks AdapterService vfunc `+0x170` for a lower AUX handle for the exact object id;
+  - if that lower AUX handle is null, the constructor immediately marks the DPCD/AUX wrapper invalid;
+  - AdapterService vfunc `+0x170`, implemented by `AdapterServiceGetAuxHandleForObjectId()`, directly calls the AUX factory stored at interface slot `a1[48]` / object `+0x1A8`;
+  - there is no EDID-only, TILE-only, or synthetic fake-AUX fallback inside this constructor path.
+- Certainty statement:
+  - if property6 bit4 is set before AdapterService and display-object construction, the normal Windows DAL route cannot produce a durable AUX-backed `0x3113`;
+  - it is blocked on both sides:
+    - enumeration side: VBIOS object count becomes zero through signal type `13`;
+    - AUX side: the lower AUX factory is null, so object-specific DPCD/AUX wrapper construction fails.
+- What this removes:
+  - `0x3113` is not expected to appear later from the synthetic tail path;
+  - `0x3113` is not expected to be rescued by the DPCD wrapper constructor after the AUX factory is suppressed;
+  - feature id `300` should not be treated as a "turn 5K on" knob in this path, because its observed property6 branches feed the hard suppressor outcome.
+- Remaining runtime unknown:
+  - static RE proves the consequence of property6 bit4, but not whether a particular boot sets it on the iMac hardware;
+  - to eliminate that last uncertainty we still need either:
+    - a runtime probe/log showing whether plain/OCLP/BootCamp construction reaches VBIOS object `0x3113` with a valid lower AUX handle; or
+    - deeper RE of the runtime capability object predicates behind vfunc `+0x8(300)` and vfunc `+0x520()`.
+- Kernel-facing implication:
+  - the Linux target should be framed as "make the internal 5K secondary route look like the property6-bit4-clear state before connector enumeration";
+  - that means preserving or constructing both parts together:
+    - object-table route for `0x3113`;
+    - valid AUX/DDC backend for `0x3113`;
+  - simply forcing a TILE EDID or late secondary connector is unlikely to match Windows if the lower AUX/backend lifetime was already lost.
+
+Extra RE continuation: runtime caps predicates behind the property6 gate
+
+- Scope:
+  - this pass attacked the remaining ambiguity in the three raw `0x100000` sources:
+    - runtime caps vfunc `+0x8(feature_id)`;
+    - runtime caps vfunc `+0x520()`.
+  - the goal was not to assign public AMD feature names, but to determine whether these are opaque "maybe 5K enable" predicates or whether their local logic can be proven.
+- New/updated IDA anchors:
+  - `0x140015910`: renamed `RuntimeCapsCheckFeature298PathWhen300Clear`;
+  - `0x140018C80`: renamed `RuntimeCapsFeatureIdTest_StoreBacked`;
+  - `0x14043E9D0`: renamed `RuntimeFeatureStoreProbeIdSideEffect`;
+  - added `IMAC5K_RE_CERTAINTY` comments at:
+    - `RuntimeCapsCheckFeature298PathWhen300Clear()` feature-300 test at `0x14001594B`;
+    - `PopulateDalAdapterInitSourceFlags()` vfunc `+0x520` callsite at `0x14019F65A`;
+    - `RuntimeCapsFeatureIdTest_StoreBacked()` feature-store probe at `0x140018CD0`;
+    - `RuntimeFeatureStoreProbeIdSideEffect()` return at `0x14043EA21`.
+- Confirmed vfunc `+0x520()` meaning in the observed runtime-caps vtable family:
+  - the `+0x520` slot points to `RuntimeCapsCheckFeature298PathWhen300Clear()`;
+  - that helper first checks feature id `300`;
+  - if feature `300` is true, it returns false immediately;
+  - only when feature `300` is false does it check feature id `298`;
+  - then it also requires a hardware/ASIC-family predicate through `sub_14003C5F0()` and related runtime caps methods.
+- Consequence for the third property6 raw source:
+  - the raw `0x940000` branch in `PopulateDalAdapterInitSourceFlags()` is no longer opaque;
+  - it is the "feature 298 path when feature 300 is clear, plus hardware predicate" path;
+  - because `0x940000` contains `0x100000`, this path still feeds property6 bit4 and the hard signal13/AUX-suppression outcome.
+- Confirmed vfunc `+0x8(feature_id)` store-backed variant:
+  - in the same vtable family, slot `+0x8` points to `RuntimeCapsFeatureIdTest_StoreBacked()`;
+  - it passes the requested feature id into `RuntimeFeatureStoreProbeIdSideEffect()`;
+  - `RuntimeFeatureStoreProbeIdSideEffect()` returns `0` on all visible paths in this IDB;
+  - therefore this store-backed vfunc variant returns true for the visible local logic;
+  - the feature id still matters as a side-effect/accounting input to the lower helper, but not as a reject condition in the visible return value.
+- Updated interpretation of the three property6 raw sources:
+  - Branch A:
+    - hardware/display-core predicate vfunc `+0x220`;
+    - feature-test vfunc `+0x8(300)`;
+    - sets raw `0x100000`.
+  - Branch B:
+    - feature-test vfunc `+0x8(300)`;
+    - hardware/display-core predicate vfunc `+0x2F8`;
+    - sets raw `0x140000`.
+  - Branch C:
+    - runtime caps vfunc `+0x520()`;
+    - resolved locally as feature `298` true while feature `300` false, plus hardware predicate;
+    - sets raw `0x940000`.
+- Certainty gained:
+  - vfunc `+0x520()` is not an unknown Apple/OCLP/5K-specific firmware trigger in this driver path;
+  - it is another route into the same hard suppressor, guarded by feature `298` with feature `300` clear;
+  - all three sources still converge on the same Linux-relevant outcome: raw `0x100000` set means property6 bit4 set, which blocks the normal `0x3113` enumeration/AUX route.
+- Remaining uncertainty:
+  - we still do not have public names for feature ids `298` and `300`;
+  - we also have not proven which runtime-caps vtable variant the iMac path uses at runtime;
+  - however, neither uncertainty weakens the main bring-up conclusion: the desired state is not "enable feature 298/300", but "avoid the raw `0x100000` / property6-bit4 suppressor for the internal 5K route".
+
+Extra RE continuation: split the two halves of the property6 source predicate
+
+- Scope:
+  - this pass focused on removing ambiguity around the two different objects used by `PopulateDalAdapterInitSourceFlags()`:
+    - the local KMD adapter context used for runtime feature/caps predicates;
+    - the display/root services object used for the hardware/display-core predicates.
+- New/updated IDA anchors:
+  - `0x140040790`: renamed `CreateKmdAdapterContextForStartDevice`;
+  - `0x1400423C0`: renamed `KmdAdapterContextGetRuntimeCapsInterface`;
+  - `0x140042450`: renamed `KmdAdapterContextGetDeviceServicesObject`;
+  - `0x1401A4180`: renamed `BuildDalDisplayInterfaceAndCoreServicesPair`;
+  - added `IMAC5K_RE_CERTAINTY` comments at:
+    - the StartDevice callsite to `BuildDalDisplayInterfaceAndCoreServicesPair()` at `0x14002A021`;
+    - the local adapter-context constructor vtable store at `0x1400407DC`;
+    - `KmdAdapterContextGetRuntimeCapsInterface()` at `0x1400423C0`;
+    - the `PopulateDalAdapterInitSourceFlags()` runtime-caps getter at `0x14019F1C7`;
+    - the display/root object predicate callsites at `0x14019F5D0` and `0x14019F628`.
+- Confirmed StartDevice argument split:
+  - `sub_141344960()` validates the dispatcher/root object and calls `sub_140029170()`;
+  - inside `sub_140029170()`, `CreateKmdAdapterContextForStartDevice()` creates the local adapter context in `r15` with vtable `off_1404F4B60`;
+  - later the call at `0x14002A021` is:
+    - out pair pointer;
+    - `dispatcher+8` root/display-services object;
+    - local adapter context `r15`;
+    - boot/start args `rsi`;
+    - `dispatcher+0xE0`;
+    - status pointer.
+- Confirmed DAL display-interface construction:
+  - `BuildDalDisplayInterfaceAndCoreServicesPair()` calls `CreateDisplayInterfaceAndInitializeDal(dispatcher+8, r15, rsi, dispatcher+0xE0, status_ptr)`;
+  - `ConstructDisplayInterfaceCommon()` calls the common constructor that stores its second argument at display-interface `+0x10`;
+  - therefore `sub_140021950(display_interface)` returns `dispatcher+8`, not `r15`.
+- Confirmed runtime-caps source:
+  - the object passed as `a2` to `PopulateDalAdapterInitSourceFlags()` is the local adapter context `r15`;
+  - its vtable is `off_1404F4B60`;
+  - vfunc `+0x38` is `KmdAdapterContextGetRuntimeCapsInterface()`;
+  - that getter returns `*(ctx+0xAC8)+0x20` or null;
+  - this returned interface is the object used for:
+    - vfunc `+0x8(feature id)`;
+    - feature id `300`;
+    - feature id `298`;
+    - vfunc `+0x520()`.
+- Corrected interpretation of the property6 raw branches:
+  - Branch A is a conjunction of two different objects:
+    - `dispatcher+8` root/display-services vfunc `+0x220`;
+    - runtime-caps interface vfunc `+0x8(300)`;
+    - together they set raw `0x100000`.
+  - Branch B is also split:
+    - runtime-caps interface vfunc `+0x8(300)`;
+    - `dispatcher+8` root/display-services vfunc `+0x2F8`;
+    - together they set raw `0x140000`.
+  - Branch C remains entirely on the runtime-caps side:
+    - runtime-caps interface vfunc `+0x520()`;
+    - resolved previously as feature `298` true while feature `300` false plus hardware predicate;
+    - sets raw `0x940000`.
+- Certainty gained:
+  - feature id `300` is definitely tested through the local adapter context's runtime-caps interface, not through the root/display-services object;
+  - the hardware/display-core predicates `+0x220` and `+0x2F8` are definitely on `dispatcher+8`, not on the local adapter context;
+  - this prevents a bad future simplification where all three raw `0x100000` sources are attributed to one feature object.
+- Remaining RE target:
+  - the next uncertainty is now narrower:
+    - identify the concrete runtime class/vtable behind `dispatcher+8` for the iMac path;
+    - then decode its vfunc `+0x220` and `+0x2F8` implementations;
+  - this is the right place to continue if we want to know exactly which hardware/display-core condition combines with feature `300` to set the property6 hard suppressor.
+
+Extra RE continuation: concrete root-services vtable behind dispatcher+8
+
+- Scope:
+  - this pass continued from the previous remaining target:
+    - identify the concrete object stored at `dispatcher/PSID context +0x8`;
+    - resolve the root/display-services vfuncs `+0x220` and `+0x2F8`;
+    - determine whether those predicates are still opaque hardware checks or can be named with local proof.
+- New/updated IDA anchors:
+  - `0x14133F010`: renamed `AtiAddDevice_CreatePsidContext`;
+  - `0x14003C690`: renamed `InitializePsidContextAndRootServices`;
+  - `0x1400767E0`: renamed `AllocateKmdRootServicesObject`;
+  - `0x140075EA0`: renamed `ConstructKmdRootServicesObject`;
+  - `0x140080320`: renamed `QueryWindowsVersionAndSetGlobalCode`;
+  - `0x14007E5C0`: renamed `RootServicesIsWindows7`;
+  - `0x14007E390`: renamed `RootServicesVirtualDalRuntimePolicyPredicate`;
+  - `0x140082500`: renamed `RootServicesSetRuntimeCapsContainer`;
+  - `0x140079C80`: renamed `RootServicesGetRuntimeCapsContainer`;
+  - added `IMAC5K_RE_CERTAINTY` comments at:
+    - PSID magic write `0x14133F240`;
+    - root-services allocation/store in `InitializePsidContextAndRootServices()` at `0x14003C6BA` and `0x14003C6D5`;
+    - root-services vtable assignment at `0x140075ED3`;
+    - vtable slots `off_1404FEAB8 + 0x220` and `+0x2F8`;
+    - OS-code writes in `QueryWindowsVersionAndSetGlobalCode()`;
+    - static feature id 20 / `KMD_EnableVirtualDalSupport` table entry.
+- Confirmed dispatcher+8 object construction:
+  - `AtiAddDevice_CreatePsidContext()` allocates the PSID/dispatcher context and writes magic `0x44495350` at `0x14133F240`;
+  - `InitializePsidContextAndRootServices()` allocates a 33608-byte root KMD services object through `AllocateKmdRootServicesObject()`;
+  - `ConstructKmdRootServicesObject(root, DeviceObject)` sets the root object's vtable to `off_1404FEAB8`;
+  - `InitializePsidContextAndRootServices()` stores the constructed root object at `PSID context +0x8`;
+  - therefore the `dispatcher+8` object used by `PopulateDalAdapterInitSourceFlags()` is concretely the `off_1404FEAB8` root KMD services object.
+- Resolved Branch A root predicate:
+  - vtable `off_1404FEAB8 + 0x220` points to `RootServicesIsWindows7()`;
+  - `RootServicesIsWindows7()` is exactly:
+    - compare global OS code `qword_141258510` low dword against `0x610`;
+    - return true only on equality.
+  - `QueryWindowsVersionAndSetGlobalCode()` sets:
+    - Windows 7 / version 6.1 -> `0x610`;
+    - Windows 8 / version 6.2 -> `0x620`;
+    - Windows 8.1 / version 6.3 -> `0x630`;
+    - Windows 10 -> `0xA00`;
+    - Windows Server 2016 -> `0xA01`.
+  - conclusion:
+    - Branch A is not a generic iMac/5K hardware predicate;
+    - Branch A is `Windows 7 && runtime feature300`;
+    - on normal Windows 10 BootCamp, this root predicate is false.
+- Resolved Branch B root predicate:
+  - vtable `off_1404FEAB8 + 0x2F8` points to `RootServicesVirtualDalRuntimePolicyPredicate()`;
+  - its return condition is:
+    - true if root flag `+0x7E9C` bit `0x100` is set, static feature id `20` equals `1`, and runtime feature id `340` is true;
+    - otherwise true if runtime-caps vfunc `+0x520()` is true and either the low byte of root flag `+0x7E9C` is not `4` or static feature id `20` is nonzero;
+    - otherwise true if root byte `+0x8340` is nonzero.
+  - static feature id `20` is not anonymous:
+    - the built-in table entry points to the wide string `KMD_EnableVirtualDalSupport`;
+    - its built-in value is `0xFFFFFFFF` / `-1`;
+    - therefore the strict `== 1` arm requires an explicit override to become true.
+  - the vfunc `+0x520()` arm calls through `root +0x370 +0x20`;
+    - the root object has paired setter/getter methods for `+0x370`;
+    - in the decoded runtime-caps family, vfunc `+0x520()` is `RuntimeCapsCheckFeature298PathWhen300Clear()`;
+    - follow-up tracing closed the assignment path:
+      - StartDevice calls KMD adapter-context vfunc `+0x2B0` at `0x140029728`;
+      - this resolves to `KmdAdapterContextCreateRuntimeCapsContainer()`;
+      - `BindRuntimeCapsContainerToKmdContextAndRoot()` stores that returned container at `ctx+0xAC8`;
+      - the same bind routine calls root vfunc `+0x668`, `RootServicesSetRuntimeCapsContainer(root, container)`, storing it at `root+0x370`;
+      - therefore `ctx+0xAC8+0x20` and `root+0x370+0x20` are the same runtime-caps interface.
+  - important consequence:
+    - Branch B's outer test requires runtime feature id `300`;
+    - the inner `+0x520()` arm is the same `RuntimeCapsCheckFeature298PathWhen300Clear()` family, which returns false when feature id `300` is true;
+    - therefore, under stable runtime-caps state, Branch B's `+0x520()` sub-arm cannot be the reason Branch B passes;
+    - Branch B can still pass through the strict Virtual-DAL arm (`KMD_EnableVirtualDalSupport == 1`, runtime feature `340`, root flag bit `0x100`) or through root override byte `+0x8340`.
+- Updated interpretation of the three raw property6 sources:
+  - Branch A:
+    - `RootServicesIsWindows7()`;
+    - runtime feature id `300`;
+    - sets raw `0x100000`.
+  - Branch B:
+    - runtime feature id `300`;
+    - `RootServicesVirtualDalRuntimePolicyPredicate()`, mostly gated by `KMD_EnableVirtualDalSupport`, runtime feature id `340`, the runtime-caps `+0x520()` path, or root override byte `+0x8340`;
+    - sets raw `0x140000`.
+  - Branch C:
+    - runtime-caps vfunc `+0x520()`;
+    - previously decoded as feature `298` true while feature `300` is clear, plus hardware predicate;
+    - sets raw `0x940000`.
+- Certainty gained:
+  - `dispatcher+8` is no longer an unknown display/core object;
+  - the vtable and the two property6-relevant root predicates are concretely resolved;
+  - the first predicate is OS-version policy, not panel detection;
+  - the second predicate is Virtual DAL/runtime-caps policy, not a direct 5K tile-pair initialization check;
+  - the root `+0x370` runtime-caps container provenance is now proven and matches the local adapter context `+0xAC8` runtime-caps container.
+- Remaining uncertainty:
+  - public names for runtime feature ids `298`, `300`, and `340` are still unknown;
+  - even with that naming gap, the Linux-relevant outcome is clearer: Windows' durable `0x3113` path is protected by avoiding these raw `0x100000` property6 suppressor branches, not by executing a hidden root-services 5K wake sequence here.
+
+Extra RE continuation: Linux-implementation value of Branch-B inputs
+
+- Scope:
+  - this was a short pass to decide whether more RE can still help Linux implementation directly;
+  - the target was Branch B's remaining root-side inputs:
+    - root flag `+0x7E9C` bit `0x100`;
+    - root override byte `+0x8340`.
+- New/updated IDA anchors:
+  - `0x140082B00`: renamed `RootServicesSetVirtualCpuFlagBit8`;
+  - `0x140082AF0`: renamed `RootServicesSetVirtualDalOverrideByte`;
+  - `0x1400826E0`: renamed `RootServicesSetFlagBit9`;
+  - `0x140082870`: renamed `RootServicesSetFlagBit10`;
+  - `0x140040F60`: renamed `KmdSystemConfigurationInitCpuInfo`;
+  - added `IMAC5K_RE_LINUX_IMPL` comments at:
+    - the Branch-B predicate input site;
+    - the root bit8 setter;
+    - the CPU-info check that drives it;
+    - the `+0x8340` override setter.
+- Confirmed root flag bit8 source:
+  - `RootServicesVirtualDalRuntimePolicyPredicate()` tests root `+0x7E9C` bit `0x100`;
+  - root vtable slot `+0x530` points to `RootServicesSetVirtualCpuFlagBit8()`;
+  - `KmdAdapterContextInitialize()` calls this setter when local adapter-context CPU/system flag `+0xBD8` has bit `0x08000000` set;
+  - `KmdSystemConfigurationInitCpuInfo()` logs that same flag as `CPU VIRTUAL`.
+- Consequence:
+  - the strict Branch-B arm is now:
+    - `CPU VIRTUAL`;
+    - `KMD_EnableVirtualDalSupport == 1`;
+    - runtime feature id `340`;
+  - this looks like a VM/Virtual-DAL policy path, not a normal bare-metal iMac 5K bring-up path.
+- Confirmed root override byte:
+  - root vtable slot `+0x300` points to `RootServicesSetVirtualDalOverrideByte()`;
+  - the predicate returns true unconditionally when root byte `+0x8340` is nonzero;
+  - this pass did not find a direct non-vtable code caller in the normal StartDevice path.
+- Linux implementation value:
+  - this further lowers the odds that Branch B encodes the Windows 5K mechanism we need to reproduce;
+  - for bare-metal Linux on the iMac, the more useful target remains avoiding the property6 hard suppressor and preserving/constructing the durable `0x3113` secondary route.
+- RE still worth doing:
+  - trace public/source names or table origins for runtime feature ids `298`, `300`, and `340`;
+  - compare old 4K-only vs first 5K-enabled BootCamp driver around the property6/object-enumeration path;
+  - trace the provider/object-info route that yields `0x3113` when the suppressor is avoided;
+  - trace the Windows false-disconnect/secondary-preservation path enough to translate it into a Linux connector-lifetime policy.
+
+Extra RE continuation: BootCamp-named DAL option and feature-id naming pass
+
+- Scope:
+  - this pass continued from the property6 suppressor branch and asked whether the remaining runtime feature ids or BootCamp-named configuration strings identify a hidden Windows-only 5K enable path;
+  - the result is useful mostly as a negative control: the only explicit `BootCamp` string found in the modern BootCamp AMD driver is real, but its decoded local effects do not create or wake the `0x3113` secondary route.
+- New/updated IDA anchors:
+  - `0x141B1EE70`: renamed `QueryDalConfigValueByName`;
+  - `0x141A379D0`: renamed `CreateTimingServiceInterface`;
+  - `0x141AB98B0`: renamed `ConstructTimingServiceAndQueryBootCampPlatform`;
+  - `0x141AB7B70`: renamed `TimingServiceRemoveTimingsBySize`;
+  - `0x144C4E008`: renamed `g_KmdBootCampPlatformOption`;
+  - added `IMAC5K_RE_BOOTCAMP_OPTION` comments at:
+    - `ConstructDal2CoreAndServices()` query of `KMD_BootCampPlatform`;
+    - `ConstructTimingServiceAndQueryBootCampPlatform()` cached-global query;
+    - the `g_KmdBootCampPlatformOption` timing-conversion use site;
+    - the exact width/height match in `TimingServiceRemoveTimingsBySize()`.
+- Confirmed `KMD_BootCampPlatform` effects:
+  - `ConstructDal2CoreAndServices()` queries named config `KMD_BootCampPlatform`;
+  - if the query succeeds and returns nonzero, it calls TimingService vfunc `+0x00` with:
+    - width `0x1400` / `5120`;
+    - height `0x870` / `2160`.
+  - that vfunc is `TimingServiceRemoveTimingsBySize()`;
+  - it iterates the timing table and removes entries whose first two dwords match the requested width/height;
+  - therefore this BootCamp-named DAL-core effect removes `5120x2160` timing, not the iMac 5K tile timing `5120x2880` or half-tile timing `2560x2880`.
+- Confirmed cached global effect:
+  - `ConstructTimingServiceAndQueryBootCampPlatform()` also queries `KMD_BootCampPlatform` into `g_KmdBootCampPlatformOption`;
+  - if the query fails, it forces the global to zero;
+  - the only direct xref consumer found in this pass is the timing-conversion helper at `0x141A376F0`;
+  - there, the BootCamp flag broadens a timing-standard branch for timing type `14`, but no `0x3113`, DPCD, AUX, DisplayID TILE, or `0x4F1` behavior is visible in that branch.
+- Local package search:
+  - `rg -a "KMD_BootCampPlatform|BootCampPlatform" BootCamp` found no hit in the unpacked local BootCamp packages;
+  - the string is present in the modern `B416406/amdkmdag.sys` IDB/binary, but this pass did not find an INF/driver-package text setting for it.
+- Runtime feature-id naming result:
+  - immediate searches for `298`, `300`, and `340` produced many false positives:
+    - `298` appears as a struct offset/copy length and in unrelated HDCP/graphics blocks;
+    - `300` is too common as an offset/size literal;
+    - `340` appears in HDMI/DPCD/timing code as a constant, including a timing divisor/default, not necessarily as runtime feature id `340`.
+  - the meaningful property6 uses remain the previously decoded ones:
+    - feature id `300` in Branch A/B;
+    - feature id `298` inside `RuntimeCapsCheckFeature298PathWhen300Clear()`;
+    - feature id `340` only inside the strict Virtual-DAL arm of `RootServicesVirtualDalRuntimePolicyPredicate()`.
+  - no public/source string name for runtime feature ids `298`, `300`, or `340` was found in this IDB pass.
+- Interpretation:
+  - `KMD_BootCampPlatform` is real BootCamp policy, but it is not the missing internal-panel route constructor;
+  - its decoded effects are timing-list policy, not CoreEG2/GOP replay, `0x3113` object enumeration, AUX factory construction, source-DPCD, ASSR, or Apple/tiled `0x4F1`;
+  - this reduces the chance that the plain-vs-BootCamp 5K split is hidden behind a single named KMD BootCamp registry key in the modern driver.
+- Linux implementation value:
+  - do not model `KMD_BootCampPlatform` as a Linux 5K bring-up knob;
+  - keep the Stage 2 Linux target outcome-based:
+    - make the internal 5K route look like the property6-bit4-clear state before connector enumeration;
+    - ensure the real VBIOS/object-info `0x3113` route reaches DDC3/AUX pin creation;
+    - then reuse the already-proven Apple/tiled EDID/DisplayID capability, ASSR, source-DPCD, and `0x4F1` machinery.
+
+Extra RE continuation: provider/object-info route that yields `0x3113`
+
+- Scope:
+  - this pass followed the positive route after the property6 hard suppressor is avoided;
+  - the question was exactly how the provider/object-info stack yields packed AMD object id `0x3113`, and which fields must exist for the route to become AUX-backed.
+- New/updated IDA anchors:
+  - `0x1415A9B10`: renamed `VbiosV2DecodeConnectorTypeFromRecordLowByte`;
+  - added `IMAC5K_RE_OBJECT_ROUTE` comments on:
+    - `VbiosV2DecodeObjectIdFromRecordRef()` at `0x1415A9DB0`;
+    - class decode at `0x1415A9D41`;
+    - instance decode at `0x1415A9C61`;
+    - connector-type low-byte decode at `0x1415A9B10` and case `0x13` at `0x1415A9BBC`;
+    - V2 id-by-index decode at `0x1415AE73E`;
+    - V2 count gate at `0x1415AE896`;
+    - lookup-by-id at `0x1415AC490`;
+    - object descriptor lookup at `0x1415AE3D4` and encoder-record parse at `0x1415AE491`;
+    - descriptor AUX fields at `0x1415AC3A2` and `0x1415AC3B8`;
+    - provider dispatch at `0x14152C936`, `0x141466844`, and create-links object-id consumption at `0x141B6D3E2`;
+    - link AUX creation at `0x141B6D84E`;
+    - final per-object AUX materialization at `0x141465B5C`.
+- Provider dispatch chain:
+  - `CreateLinksFromBiosObjectTable()` gets the BIOS/display object service from display-core context `+0x340 -> +0x58`;
+  - it calls that service's count slot to determine physical connector count, then calls its id-by-index slot for each physical connector index;
+  - the service is the AdapterService provider stack:
+    - `AdapterServiceGetTotalDisplayObjectCount()` combines ObjectInfo/VBIOS count, synthetic-tail count, and DisplayDescriptorCapabilityFlags count;
+    - `AdapterServiceGetDisplayObjectIdByIndex()` resolves in this order:
+      - ObjectInfoDescriptorAdapter / VBIOS object-info provider first;
+      - DisplayDescriptorCapabilityFlags provider second;
+      - synthetic tail last.
+  - the capability provider only builds low-byte `0x16/0x17`, and the synthetic tail only builds low-byte `0x18` / class-2 low-byte `0x26`;
+  - therefore a real `0x3113` can only come from the first bucket, the ObjectInfoDescriptorAdapter wrapping the VBIOS parser.
+- VBIOS parser object id path:
+  - `ObjectInfoDescriptorAdapterGetDisplayObjectIdByIndex()` is a thin delegate to the parser vfunc `+0x30`;
+  - `VbiosParserV2GetDisplayObjectCount()` returns zero if base-pin signal type is `13`; otherwise it walks the VBIOS object-info table:
+    - entry count is byte `objectInfoTable + 0x06`;
+    - entries are 16 bytes;
+    - an entry is counted when its object-ref word and encoder-ref word are present.
+  - `VbiosParserV2GetDisplayObjectIdByIndex()` reads the object-ref word from the selected 16-byte entry, shown in code as `objectInfoTable + 0x08 + 16*i`;
+  - `VbiosV2DecodeObjectIdFromRecordRef()` decodes that 16-bit reference:
+    - class = bits `14:12`, with value `3` meaning class-3 display connector;
+    - instance = bits `10:8`, so `1` means connector instance 1;
+    - connector type = low byte for class `3`; low byte `0x13` returns type `0x13`.
+  - `ObjectIdBuildCoreFields()` packs those fields as:
+    - low byte/type at bits `7:0`;
+    - instance nibble at bits `11:8`;
+    - class nibble at bits `15:12`.
+  - therefore a VBIOS record ref shaped as `class=3, instance=1, type=0x13` yields packed object id `0x3113` directly. There is no later magic translation that invents the `0x13`.
+- Descriptor/AUX route path:
+  - `VbiosParserV2GetObjectDescriptor()` resolves the same packed object id through `VbiosV2FindObjectRecordByObjectId()`;
+  - for class-3 ids such as `0x3113`, that lookup compares the requested object id against the decoded object-ref word of each 16-byte VBIOS object entry;
+  - once it finds the record, it walks the record's encoder-record list until it finds record type `1`;
+  - `ParseVbiosV2EncoderRecordToObjectDescriptor()` then matches encoder byte `record+2` against the GPIO/I2C selector table referenced by parser field `+0x6C`;
+  - it writes:
+    - descriptor `+0x1C` = AUX/DDC selector from the matching selector-table row, e.g. the iMac secondary DDC3/AUX selector path such as `0x4871`;
+    - descriptor `+0x3C` = source/index byte from the same row.
+  - `AdapterServiceGetAuxHandleForObjectId()` consumes that descriptor:
+    - reads descriptor `+0x1C` selector;
+    - turns descriptor `+0x3C` into `source_mask = 1 << value`;
+    - calls the AdapterService AUX factory at object `+0x1A8`.
+- Link construction path:
+  - `ConstructLegacyConnectorDisplayEntry()` receives the packed object id from the BIOS object service;
+  - if the low byte is `0x13`, it maps the link to runtime signal `32`;
+  - if the low byte is `0x14`, it maps the link to runtime signal `128`;
+  - for `0x3113`, Windows then creates the normal per-link DDC/AUX service with `CreateDceAuxDdcService()` before building the link encoder.
+- Certainty gained:
+  - `0x3113` is not synthesized by DisplayDescriptorCapabilityFlags, the synthetic tail, BootCamp timing policy, or a TILE parser;
+  - the packed id is the direct decode of a VBIOS object-info record reference;
+  - the durable route requires two independent pieces to survive:
+    - the object-info table must expose the `0x3113` object-ref entry before the signal-13/property6 zero-count gate;
+    - the descriptor parse must resolve the selector/source fields so the AUX factory can create the per-object AUX handle.
+- Linux implementation value:
+  - Stage 2 logging should happen before any Linux tile synthesis:
+    - raw VBIOS object-info revision;
+    - raw object-info entry count;
+    - per-entry object-ref word, encoder-ref word, and decoded packed object id;
+    - whether an entry decodes to `0x3113`;
+    - selector/source fields for the decoded `0x3113`;
+    - whether Linux resolves that selector to the expected DDC3/AUX channel and builds a valid AUX backend.
+  - if plain boot lacks the raw `0x3113` entry, the kernel cannot reproduce Windows by only forcing EDID or TILE metadata later;
+  - if the raw `0x3113` entry exists but descriptor/AUX materialization fails, the target is selector/source/AUX-factory handling, not panel mode selection.
+
+Extra RE continuation: Windows false-disconnect path as Linux connector lifetime policy
+
+- Scope:
+  - this pass mapped the Windows false-disconnect preservation path into a concrete Linux connector/sink lifetime rule;
+  - target question: where exactly does Windows stop a transient secondary disconnect from destroying the live 5K tile route, and what is the closest Linux analogue?
+- New/updated IDA anchors:
+  - added `IMAC5K_RE_LIFETIME_POLICY` comments on:
+    - `DetectDisplayAndApplyApple5kOverrides()` false-disconnect gate at `0x1414B4174`;
+    - result correction writes at `0x1414B417E` and `0x1414B418A`;
+    - `HandleDisplayDetectionResultAndLiveState()` changed/apply gates at `0x1414A8D20` and `0x1414A8DD9`;
+    - `ApplyDetectionResultAndUpdateLiveDisplayObject()` -> `UpdateDisplaySinkConnectionAndLiveAuxState()` boundary at `0x1414A84CA`;
+    - `UpdateDisplaySinkConnectionAndLiveAuxState()` live-record update call at `0x1414A7E21`;
+    - `UpdateDetectionRecordLiveDisplayObject()` record `+0x18` clear at `0x1414B3B45`;
+    - display-map release helper at `0x1414AE020`;
+    - display-map refcount byte clear at `0x1414ABD94`;
+    - low-byte `0x13` detection-record policy/candidate insertion at `0x1414B4544` and `0x1414B4619`;
+    - alternate direct live-state caller at `0x141430DBC`;
+    - record notification sweep at `0x1414B4409`.
+- Confirmed Windows lifetime boundary:
+  - the false-disconnect decision is made while the 120-byte detection result is still mutable;
+  - the gate requires all of:
+    - connected-pin descriptor byte `+6` bit `3` set, matching the Apple/tiled `0x3B` family;
+    - the current display object still reports connected through vfunc `+0x258`;
+    - the fresh detection result says disconnected at result byte `+0x72`;
+    - current Windows signal type is `11`, the local DP/SST signal value.
+  - when those are true, Windows writes:
+    - result byte `+0x72 = 1`;
+    - result byte `+0x70 = 0`.
+  - that makes `HandleDisplayDetectionResultAndLiveState()` compute `changed = false`;
+  - because `changed` is false and the rescan byte is clear, it does not call `ApplyDetectionResultAndUpdateLiveDisplayObject()`;
+  - because that call is skipped, `UpdateDisplaySinkConnectionAndLiveAuxState()` is skipped;
+  - because that call is skipped, `UpdateDetectionRecordLiveDisplayObject()` cannot clear detection-record `+0x18`.
+- Confirmed what would be destroyed without the correction:
+  - `UpdateDetectionRecordLiveDisplayObject()` finds the 104-byte record for the object's packed id;
+  - if the display object is connected, it stores the live display object pointer at record `+0x18`;
+  - if the display object reports disconnected, it calls `NotifyDetectionRecordDisconnected()` and clears record `+0x18`;
+  - this is the direct Windows analogue of losing the secondary connector's real live sink/object, not just losing a DRM TILE blob.
+- Important distinction:
+  - Windows still runs `ReleaseDisplayMapEntriesAfterDetectPass()` after the false-disconnect correction;
+  - that path decrements display-map entry refcounts at entry `+0x0C` and clears byte `+0x12` when the refcount reaches zero;
+  - it does not clear the detection-record live object pointer at record `+0x18`;
+  - therefore the policy is selective:
+    - preserve the already-live secondary object through a known transient detect loss;
+    - do not globally pin every display-map entry, every stream interface, or every AUX reference forever.
+- Why this matters for Linux:
+  - Linux should not model this as "if the secondary disappears, create a fake sink";
+  - the Windows-shaped behavior is "if the exact proven secondary route reports a transient disconnect, do not let that disconnected result replace the existing live sink state";
+  - in amdgpu terms, the closest boundary is before the disconnected detect path releases `aconnector->dc_sink`, clears DRM EDID/TILE state, or lets `dc_link->local_sink` / `dpcd_sink_count` collapse for the internal secondary route.
+- Proposed Linux connector lifetime policy:
+  - only enable on the iMac 5K tiled-display quirk path;
+  - only target the secondary internal route, not arbitrary DP connectors;
+  - require route identity proof:
+    - packed object id equivalent to Windows `0x3113`, or the Linux-decoded route that maps to the same physical object;
+    - expected DDC/AUX selector, currently the DDC3/AUX pin path seen in the Windows route;
+    - expected transmitter/encoder pairing for the secondary internal tile;
+    - not an MST root or external DP connector.
+  - require prior real-route proof before suppression:
+    - a real non-emulated sink was observed earlier on the secondary; or
+    - preserved EDID/TILE metadata was captured from a real secondary sink; or
+    - concrete AUX/DPCD evidence exists, e.g. secondary source-DPCD programming, ASSR/DPCD `0x10A`, or panel/private `0x4F1` evidence.
+  - require the current event shape to match Windows:
+    - the fresh detection result is disconnected or sinkless;
+    - the connector still has a real previous sink/object to preserve;
+    - route identity still matches the internal secondary;
+    - this is not a user-visible external hot-unplug path.
+  - on suppression:
+    - keep the existing `aconnector->dc_sink` and/or restore `dc_link->local_sink` from it before generic disconnect cleanup runs;
+    - keep a nonzero `dpcd_sink_count` for the route while the paired 5K commit is being assembled;
+    - keep/restage the real EDID and TILE state from the prior secondary snapshot;
+    - mark/log the event as false-disconnect suppression, not as a new detection success;
+    - continue normal mode/freesync/subconnector updates that do not destroy the live object.
+  - clear preservation when:
+    - the connector no longer matches the secondary route identity;
+    - the primary/internal tile peer disappears or the quirk is disabled;
+    - a full disable of both tiles is intentional;
+    - repeated AUX/DPCD probes fail after the paired-commit window;
+    - suspend/GPU reset causes the saved physical-route proof to become stale.
+- Assessment of current Linux direction:
+  - the current `amdgpu_dm_imac5k_should_suppress_secondary_false_disconnect()` shape is conceptually aligned with Windows:
+    - it checks quirk enabled;
+    - requires `imac5k_secondary_head`;
+    - verifies the Windows-like route;
+    - requires a disconnected fresh detect result;
+    - requires a real live previous sink;
+    - rejects MST root;
+    - requires AUX/DPCD evidence.
+  - the current suppression block in `amdgpu_dm_update_connector_after_detect()` is also at the right layer because it runs before the generic disconnected branch releases `aconnector->dc_sink` and clears EDID state;
+  - what still deserves care in implementation/testing:
+    - do not let `dc_link_detect()` or a lower DC helper clear `dc_link->local_sink` too early without restoring from the preserved real sink;
+    - do not treat preserved EDID/TILE alone as sufficient if route identity and AUX evidence were never proven;
+    - do not hold the preservation state forever after repeated AUX failure or a deliberate full modeset disable.
+- Bottom line:
+  - Windows preserves the secondary by preventing a known false disconnected result from becoming a live-object teardown;
+  - the Linux policy should be a narrow detect-stage lifetime guard for the proven `0x3113` secondary route, with explicit proof and explicit expiration.
+
+### RE continuation: Linux/Windows `0x3113` AUX route construction side by side
+
+Scope note:
+- This pass did not add new live IDA names/comments because the IDA MCP tool namespace was not exposed in this Codex turn.
+- The Windows side below is therefore a synthesis of the earlier IDA-anchored notes in this file.
+- The Linux side was checked directly against the current `linux-imac-5k` source and the plain/OCLP boot logs.
+
+Windows route construction model:
+- The secondary tile route starts from the real AMD/VBIOS display object `0x3113`; earlier RE found no evidence that Windows synthesizes this object out of GOP replay state.
+- `ConstructDpcdAuxInterfaceForObjectId` asks the adapter service for the lower AUX handle for that exact object id.
+- The adapter-service connector descriptor carries:
+  - selector/register `+0x1C = 0x4871` for secondary `0x3113`, matching DCE DDC3 A / `mmDC_GPIO_DDC3_A`;
+  - selector/register `+0x1C = 0x4875` for primary `0x3114`, matching DCE DDC4 A;
+  - source-mask information at descriptor `+0x3C`.
+- The AUX factory path resolves `0x4871 -> pin index 2` and builds a dual-pin AUX/DDC transaction handle using the DDC data/clock endpoints.
+- Earlier Windows RE also found that the display-map path can populate a per-object DPCD/AUX interface at record `+0x18` before a final live-sink/detection result is committed.
+- The important distinction is that Windows can have an object-specific DPCD/AUX route for `0x3113` even while later detection/lifetime logic decides whether the secondary is currently live.
+
+Linux route construction model:
+- `dc_create()` calls `create_links()`, which asks the BIOS parser for connector count and connector ids.
+- For object-info table rev 4/5, `bios_parser_get_connectors_number()` counts display paths with a nonzero encoder object, and `bios_parser_get_connector_id()` returns the decoded connector object from `display_objid`.
+- For a given connector, `construct_phy()`:
+  - stores the decoded `link_id`;
+  - calls `get_src_obj()` to recover the encoder object from the same display path;
+  - translates internal UNIPHY1 enum 2 to `TRANSMITTER_UNIPHY_D`, which is the secondary route expected for `0x3113`;
+  - calls `link_create_ddc_service()` before HPD-based detection decides whether a sink is present.
+- `link_create_ddc_service()` calls `bios_parser_get_i2c_info()`, which walks the connector record list for `ATOM_I2C_RECORD_TYPE`, maps the I2C id through the GPIO pin LUT, and creates a DDC GPIO pin.
+- Plain-boot logs already prove this Linux construction succeeds at the physical route level:
+  - secondary raw object is `0x3113`;
+  - DDC hardware instance is `2`, matching DDC3;
+  - DDC line/channel match the DDC3 route;
+  - transmitter is `UNIPHY_D`;
+  - a `ddc_pin` object exists.
+
+Where the side-by-side diverges:
+- Linux constructs the `0x3113` link/DDC/encoder route, but the normal DP detect path refuses to use it when HPD is low.
+- `link_detect_connection_type()` treats ordinary DisplayPort HPD-low as `dc_connection_none`.
+- `detect_link_and_local_sink()` then disconnects any previous local sink and only enters the DP `detect_dp()` / DPCD / EDID path if the connection type is not `none`.
+- `set_ddc_transaction_type(..., I2C_OVER_AUX)` and `link->aux_mode = link_is_in_aux_transaction_mode(link->ddc)` happen inside that connected path.
+- Therefore, in plain boot, `DP-1` / `0x3113` can have the correct DDC3 pin and UNIPHY_D route while still reporting `aux_mode=0`; later DPCD reads fail because the AUX transaction mode was never armed.
+- OCLP/richer boots show the same route later with `aux_mode=1`, HPD high, a local sink, EDID, and trained DPCD state, so the physical route identity is not the missing piece.
+
+Linux implementation implication:
+- Do not treat current plain-boot `aux_mode=0` as proof that the `0x3113` route was not constructed.
+- Split the current route check into three concepts:
+  - `route_identity_ok`: object `0x3113`, DDC3/hw instance 2, DDC pin present, transmitter `UNIPHY_D`;
+  - `aux_transport_armed`: DDC transaction mode has been switched to AUX and a basic DPCD read can execute;
+  - `live_sink_ok`: detection produced a real `local_sink`, EDID, TILE data, and nonzero sink count.
+- The next kernel target should be an iMac5K secondary-only pre-detect AUX activation/probe:
+  - first require `route_identity_ok` without requiring `aux_mode`;
+  - temporarily arm or force the DDC transaction type for the exact `0x3113`/DDC3/UNIPHY_D route;
+  - read a harmless DPCD byte such as `0x000` before the ordinary HPD-low DP detect gate returns `none`;
+  - if the read succeeds, continue with the secondary source-DPCD/ASSR/`0x4F1`/training path and then retry or override secondary detection narrowly for the internal tile.
+- The current `amdgpu_dm_imac5k_verify_windows_route()` shape should not require `aux_mode` for the earliest plain-boot probe, because that rejects the real route before Linux has a chance to arm AUX.
+
+Open RE item for a future live IDA pass:
+- Confirm whether Windows' `CreateDceAuxDdcService` explicitly switches the lower handle into AUX transaction mode before HPD/live-sink detection, or whether the Windows DPCD interface can issue AUX transactions independently of the connector-ready state.
+- This would sharpen the exact Linux analogue, but it does not change the current conclusion that object/DDC/encoder construction already succeeds on Linux plain boot.
+
+### Live IDA confirmation: Windows `0x3113` AUX route construction
+
+Date: 2026-05-23.
+
+Loaded binary:
+- `C:\proj\reverse\WT6A_INF\B416406\amdkmdag.sys.i64`
+- module `amdkmdag.sys`
+- SHA-256 `ac79119d7a64fc2619391ed972febf6c740d0199fd6ebb2fabb4728775a2fc05`
+
+Confirmed call chain:
+- `ConstructDisplayTopologyManager` calls `PopulateDisplayMapAuxObjectsForHotplugRange` at `0x14143B03E`.
+- `PopulateDisplayMapAuxObjectsForHotplugRange` at `0x1414B8600`:
+  - asks AdapterService vfunc `+0x60` for total display-object count;
+  - asks AdapterService vfunc `+0x258` for the synthetic-tail count;
+  - loops only over `[0, total - synthetic_tail)`, so this AUX population path is for real/provider-backed objects, not synthetic tail objects;
+  - enumerates object ids through AdapterService vfunc `+0xD0`;
+  - calls `CreateDisplayMapInterfaceForObjectIdMaybeSkipInternal`;
+  - calls `CreateDpcdAuxInterfaceForObjectId` at `0x1414B8754`;
+  - stores the returned DPCD/AUX interface at display-map entry `+0x18`;
+  - expands display paths and streams only after `entry+0x18` is populated.
+- `CreateDpcdAuxInterfaceForObjectId` at `0x141551400` has exactly one code xref: the population site above.
+- `ConstructDpcdAuxInterfaceForObjectId` at `0x141551090`:
+  - calls AdapterService vfunc `+0x170` at `0x1415511A1`;
+  - passes the original object id;
+  - invalidates the wrapper if the lower handle is null.
+- AdapterService vfunc `+0x170` resolves to `AdapterServiceGetAuxHandleForObjectId` at `0x141465AA0`.
+- `AdapterServiceGetAuxHandleForObjectId`:
+  - first calls AdapterService vfunc `+0x100`, resolved as `AdapterServiceQueryObjectDescriptor` at `0x1414663A0`;
+  - derives the AUX selector and source mask from the descriptor;
+  - calls the AdapterService AUX factory with selector/source mask at `0x141465B5C`.
+- `AuxFactoryCreateHandleForSourceMask` at `0x14152AE80` creates a `ConstructDualPinAuxTransactionHandle` object.
+- `ConstructDualPinAuxTransactionHandle` at `0x1415B0C20`:
+  - resolves selector/source mask via `ResolveSourceMaskToPinIndex`;
+  - opens endpoint type `3` for the resolved pin index;
+  - opens endpoint type `4` for the same pin index;
+  - invalidates the handle if either endpoint is missing.
+- `Dce11ResolveAuxSelectorToPinIndex` at `0x141695990` confirms the exact literal selector mapping:
+  - `0x4869 -> 0`;
+  - `0x486D -> 1`;
+  - `0x4871 -> 2`;
+  - `0x4875 -> 3`;
+  - `0x4879 -> 4`;
+  - `0x487D -> 5`;
+  - `0x4881 -> 6`;
+  - `0x4899 -> 7`.
+
+Direct Linux comparison:
+- Windows secondary object `0x3113` uses selector `0x4871`, which resolves to AUX pin index `2`.
+- Linux plain-boot logs show the same physical route as:
+  - raw object `0x3113`;
+  - DDC hardware instance `2`;
+  - DDC3 line/channel;
+  - transmitter `UNIPHY_D`;
+  - non-null `ddc_pin`.
+- This confirms that Linux already constructs the Windows-equivalent physical route.
+- The Linux gap remains transport activation/detect policy, not route discovery:
+  - Windows can construct a durable per-object DPCD/AUX backend at display-map entry `+0x18`;
+  - Linux creates the DDC pin but ordinary DP detect leaves `aux_mode=0` when HPD is low, so the route is physically present but not yet usable for DPCD.
+
+IDA annotations made:
+- `0x1414B8754`: display-map population creates per-object DPCD/AUX before stream expansion.
+- `0x1415511A1`: DPCD wrapper asks AdapterService vfunc `+0x170` for object-specific lower AUX handle.
+- `0x141465AA0`: object id to descriptor/selector/source-mask/AUX-factory bridge.
+- `0x1414663E9`: descriptor query provider feeding selector/source fields.
+- `0x141465B5C`: final AUX factory call using descriptor selector/source mask.
+- `0x141695B0A`: `0x4871 -> AUX pin index 2`.
+- `0x1415B0D4A`: endpoint type `3` opens DDC data side.
+- `0x1415B0DB7`: endpoint type `4` opens DDC clock side.
+- `0x141466F0D`: total object count includes VBIOS/object-info provider count.
+- `0x141460B52`: synthetic-tail logic is not the real `0x3113` 5K/4K route decision.
+
+Updated certainty:
+- Certain: Windows' `0x3113` route is real object-table/provider-backed route materialized through descriptor selector `0x4871` and dual DDC endpoints.
+- Certain: Linux plain boot already has the same object/DDC/transmitter route identity.
+- Still open: whether Windows' DPCD interface explicitly arms AUX before HPD/live-sink detection, or whether its lower DPCD object can transact independently of a live-sink state bit.
+
+### Live IDA continuation: DPCD transaction boundary after `entry+0x18`
+
+Date: 2026-05-23.
+
+Target question:
+- Once Windows has the `0x3113` lower AUX handle, do DPCD reads/writes require a live-sink/HPD state, or can they transact from the object-specific lower handle alone?
+
+Confirmed DPCD interface vtable for display-map entry `+0x18`:
+- `off_141FAC048 + 0x00 -> DpcdAuxReadUpTo16Bytes` at `0x14154F320`;
+- `off_141FAC048 + 0x08 -> DpcdAuxWriteUpTo16Bytes` at `0x14154F020`.
+
+`DpcdAuxReadUpTo16Bytes` / `DpcdAuxWriteUpTo16Bytes` behavior:
+- length is limited to `<= 0x10`;
+- the object-local lower AUX transaction handle is copied from the DPCD wrapper;
+- a stack DPCD request is built:
+  - read uses `BuildDpcdAuxReadRequest`;
+  - write uses `BuildDpcdAuxWriteRequest`;
+- the request is submitted through the copied lower transaction path via `SubmitDpcdAuxRequest`;
+- status is read from the request object and mapped back to a driver status.
+
+Important absence:
+- No HPD check is visible in the DPCD read/write wrapper.
+- No live-display-object or detection-record pointer is consulted in the DPCD read/write wrapper.
+- The visible transport gate is the lower AUX handle already stored in the DPCD wrapper, plus request length.
+
+Lower dual-pin AUX handle path:
+- `ConstructDualPinAuxTransactionHandle` had already shown that the lower handle requires both endpoint type `3` and endpoint type `4` for the resolved pin.
+- The vtable at `off_141FB08E0` includes:
+  - `DualPinAuxHandleConfigureTransaction`;
+  - `DualPinAuxHandleSubmitTransaction`;
+  - `DualPinAuxHandleSetTransactionFlags`.
+- `DualPinAuxHandleSubmitTransaction` forwards the transaction through both endpoint proxies.
+- The endpoint factory opens endpoints by type/pin:
+  - case `3` opens/creates DDC DATA by pin index;
+  - case `4` opens/creates DDC CLOCK by pin index.
+- The DCE11 endpoint transaction/register layer programs DDC GPIO/AUX registers; no display HPD/live-sink predicate is visible in this lower layer.
+
+Generic object-id AUX helper:
+- Renamed `0x1416B03B0` to `AdapterServiceAuxReadWriteForObjectId`.
+- This helper is another object-id based path:
+  - object owns/stores an AdapterService pointer at `+0x28`;
+  - object id is stored at `+0x30`;
+  - the helper calls AdapterService vfunc `+0x170` to obtain the lower AUX handle for that object id;
+  - mode `2` builds DPCD AUX read/write requests;
+  - mode `0` builds I2C-over-AUX style requests.
+- Again, the visible gate is `AdapterServiceGetAuxHandleForObjectId` returning a lower handle for the object id, not a live-sink/HPD condition.
+
+IDA annotations made in this continuation:
+- `0x14154F400`: DPCD read copies lower AUX handle and submits a <=16-byte DPCD request; no HPD/live-sink predicate visible.
+- `0x14154F100`: DPCD write mirrors read and uses the lower handle/request path.
+- `0x1414707DF`: request submission dispatches through the copied lower transaction path.
+- `0x1415B09A7`: dual-pin submit forwards through DATA endpoint.
+- `0x1415B09CA`: dual-pin submit forwards through CLOCK endpoint.
+- `0x14152A412`: endpoint factory case `3` opens/creates DDC DATA by pin index.
+- `0x14152A432`: endpoint factory case `4` opens/creates DDC CLOCK by pin index.
+- `0x141696040`: DCE11 DDC endpoint transaction programming touches DDC GPIO/AUX registers only.
+- `0x1416B046E`: generic object-id helper obtains lower AUX handle through AdapterService vfunc `+0x170`.
+- `0x1416B0610`: generic helper mode `2` DPCD write request.
+- `0x1416B064C`: generic helper mode `2` DPCD read request.
+
+Updated Linux implication:
+- Windows' lower transport model now looks even closer to the Linux patch we want:
+  - prove route identity first;
+  - obtain or arm the lower AUX/DDC transaction path for that object;
+  - issue a small DPCD probe before relying on HPD/live-sink state.
+- Linux should not wait for ordinary DP HPD-high detection before it even tries to put the proven `0x3113` DDC3 route into AUX transaction mode.
+- The first plain-boot probe should be intentionally tiny:
+  - exact route only: `0x3113` / DDC3 / hw instance `2` / `UNIPHY_D`;
+  - force or arm AUX transaction mode;
+  - read DPCD `0x000`;
+  - log HPD before/after but do not require HPD as a precondition.
+
+Previously open:
+- At this point we had not proven every higher-level caller policy above the DPCD object.
+- The next live IDA pass below refines that: the lower transport remains object/pin-handle based, while stream enable is gated by Windows' logical stream/VC sink-present state.
+
+### Live IDA continuation: higher-level caller policy above `entry+0x18`
+
+Date: 2026-05-23.
+
+Target question:
+- After Windows builds the object-specific `0x3113` DPCD/AUX backend, do higher-level callers still require live HPD before they use it?
+- Or are there paths that carry/probe the backend first and only later reconcile live-sink state?
+
+Answer:
+- The lower DPCD/AUX object does not have an HPD/live-sink predicate.
+- Display topology construction also does not require HPD before carrying the backend upward:
+  - `ConstructDisplayObjectAndStreams` passes display-map entry `+0x18` into `CreateDisplayCapabilityServiceInterface`;
+  - `ConstructDisplayCapabilityService` stores that pointer at service `+0x50`;
+  - `BuildStreamForDisplayEntryPath` copies display-map entry `+0x18` into stream init data `+0x18`;
+  - `ConstructDpStreamObjectWithDpcdInterface` stores that init pointer into the DP stream object (`stream+0x50` and `stream+0xB8` path already annotated).
+- The late stream-enable path does have a higher-level guard, but it is not the lower AUX route:
+  - `EnableValidatedStreamMaybeAssert4F1` calls `ValidateDisplayIndexSinkMappedPresent`;
+  - `ValidateDisplayIndexSinkMappedPresent` requires the stream/VC entry to be mapped and `StreamVcEntryIsSinkPresent(entry)` to be true;
+  - `StreamVcEntryIsSinkPresent` is just `entry+0x338 bit0`.
+
+Important distinction:
+- Windows separates three concepts:
+  - durable per-object DPCD/AUX route: display-map `entry+0x18`;
+  - display-map live bookkeeping: entry bytes `+0x10/+0x11` and detect-pass refcount `+0x0C`;
+  - stream/VC logical sink-present state: stream entry `+0x338 bit0`.
+- The DPCD route can be created and stored before the final live-display update.
+- Stream enable requires the logical stream/VC sink-present bit, but that bit can be preserved or re-marked by detect/recovery paths.
+
+Caller-side evidence:
+- `WriteSinkDpcd4F1Payload1Retry` writes DPCD `0x4F1=1` through display-map `entry+0x18` after resolving the object id; it does not use the detection record's live object slot.
+- `ProbeDisplayStatusMaybeAssert4F1` validates the current status backend against display-map `entry+0x18/+0x20` before status handling and optional `0x4F1`.
+- `DetectDisplayMaybeAssert4F1ForCapableSink` reaches that detect/status-time `0x4F1` writer when descriptor byte `+6 bit2` is observed.
+- The separate stream-enable `0x4F1` path accepts descriptor byte `+6 bit2` or `+6 bit3`, which remains the stronger Apple internal-tile path for AE26/tag `0x3B`.
+
+False-disconnect / preservation link:
+- `DetectDisplayAndApplyApple5kOverrides` has the Apple/tiled false-disconnect gate:
+  - descriptor byte `+6 bit3` set;
+  - current display object still connected;
+  - fresh detect result says disconnected;
+  - current signal type is `11`;
+  - then it forces `detection_result.connected = 1` and clears the changed/rescan flag.
+- `HandleDisplayDetectionResultAndLiveState` only calls the destructive live-object update on changed/rescan/embedded-panel cases.
+- Therefore the tag `0x3B` correction preserves the already-live logical sink/stream state instead of letting the disconnect path clear it.
+
+New IDA names/comments from this pass:
+- `0x141443B90` -> `ValidateDisplayIndexSinkMappedPresent`
+- `0x1414D0580` -> `StreamVcEntryIsSinkPresent`
+- `0x1414D0540` -> `SetStreamVcEntrySinkPresent`
+- `0x1414D0310` -> `StreamVcEntryHasPayloadAllocated`
+- `0x1414D0460` -> `GetStreamVcEntryDisplayRecord`
+- `0x1414D0C70` -> `FindStreamVcEntryByDisplayIndex`
+- `0x1414D0A90` -> `FindFreeStreamVcEntryForDetect`
+- `0x1414D09F0` -> `FindPresentStreamVcEntryBySinkGuid`
+- Added comments at the stream-present guard, setter, detect/re-detect present-bit transitions, and Apple/tag `0x3B` false-disconnect preservation gate.
+- Added comments at the capability/stream construction handoff points where display-map `entry+0x18` is consumed before the display-map entry is marked live.
+
+Linux implication:
+- Do not model Windows as "wait for HPD, then create the secondary route".
+- A closer Linux model is:
+  - keep/build the proven `0x3113` DDC3/UNIPHY_D route even when ordinary HPD says disconnected;
+  - arm AUX on that exact route and perform a tiny DPCD probe;
+  - if the probe and Apple/tile predicates match, preserve/create the logical secondary sink state narrowly;
+  - only then allow the tile-pair stream enable path to run.
+- The missing Linux behavior is likely not only an AUX transaction primitive. It is also a lifetime policy: the secondary internal tile must not be torn down just because the ordinary DP detect pass briefly reports "not connected" on this exact Apple/tiled route.
+
+### Live IDA certainty pass: why both Linux pieces are required
+
+Date: 2026-05-23.
+
+Question:
+- Can we turn "Linux likely needs both AUX route activation and logical sink preservation" into a firmer statement?
+
+Answer:
+- Yes. Windows' stream-enable wrapper has explicit logical stream/VC gates before it calls the actual stream-enable worker.
+- A durable `entry+0x18` DPCD/AUX route is necessary, but not sufficient.
+
+Confirmed stream-enable gates:
+- `EnableStreamValidatedWrapperMaybe4F1` first calls `StreamVcEntryEnablePrecheckByDisplayIndex` at `0x1414F4FC0`.
+- `StreamVcEntryEnablePrecheckByDisplayIndex`:
+  - finds the stream/VC display-record subobject by display index through `FindStreamVcEntryByDisplayIndex`;
+  - follows display-record `+0x10`, which is a back-pointer to the owning stream/VC entry;
+  - follows entry vfunc `+0xA0`, which returns the mapped emulated-sink object at entry `+0x3A8` / `+936`;
+  - reads the emulated-sink object's `ConnectionStatus` flags through vfunc `+0x50`;
+  - requires `ConnectionStatus bit0` set before the stream-enable wrapper proceeds.
+- If that precheck passes, `EnableValidatedStreamMaybeAssert4F1` then calls `ValidateDisplayIndexSinkMappedPresent`.
+- `ValidateDisplayIndexSinkMappedPresent` requires:
+  - the stream/VC entry exists;
+  - the display-record back-pointer is mapped to its owning stream/VC entry;
+  - `StreamVcEntryIsSinkPresent(entry)` is true, which is `entry+0x338 bit0`.
+
+Confirmed display-object disconnect propagation:
+- The display object connected getter/setter were resolved from the full display-object vtable:
+  - vfunc `+0x258` -> `FullDisplayObjectIsConnected` at `0x14154A560`;
+  - vfunc `+0x418` -> `FullDisplayObjectSetConnected` at `0x14154A4D0`;
+  - both operate on the connected byte at interface `+0x188`.
+- `UpdateDisplaySinkConnectionAndLiveAuxState` writes the detection-result connected byte into the display object through this setter.
+- `UpdateDetectionRecordLiveDisplayObject` clears detection-record `+0x18` when the updater runs and the display object reports disconnected.
+- Therefore the Apple/tag `0x3B` false-disconnect correction is not cosmetic:
+  - it prevents the connected byte from being written false;
+  - it prevents the detection-record live display object pointer from being cleared;
+  - it preserves the state that later stream/mode construction resolves through `stream_arg+0x178`.
+
+New IDA names/comments from this pass:
+- `0x14154A560` -> `FullDisplayObjectIsConnected`
+- `0x14154A4D0` -> `FullDisplayObjectSetConnected`
+- `0x1414F4FC0` -> `StreamVcEntryEnablePrecheckByDisplayIndex`
+- Added comments at the stream-enable precheck, display-object connected setter/getter, and live-record clear.
+
+Updated certainty:
+- Certain: Windows separates "DPCD/AUX route exists" from "logical stream/VC sink is present and ready".
+- Certain: stream enable will not run from the DPCD route alone; it needs the logical stream/VC gates to pass.
+- Certain: the tag `0x3B` false-disconnect path preserves display-object/live-record state before the destructive updater clears it.
+- Still not perfectly mapped one-to-one: the Windows stream/VC entry and backing-object readiness bit do not have a single obvious Linux struct equivalent. In Linux terms, the closest implementation rule is still:
+  - keep the exact `0x3113` route and AUX transport usable;
+  - preserve/create the real secondary `dc_sink` / connector sink state narrowly for the Apple/tiled internal route;
+  - do not let a transient ordinary DP disconnect path clear the secondary before tile-pair stream enable.
+
+### Live IDA continuation: stream/VC readiness object
+
+Date: 2026-05-23.
+
+Question:
+- What is the backing object tested by `StreamVcEntryEnablePrecheckByDisplayIndex`, and can we turn the "both pieces required" conclusion into a more exact Windows state requirement?
+
+Correction to the previous reading:
+- `FindStreamVcEntryByDisplayIndex()` returns `GetStreamVcEntryDisplayRecord(entry)`, not the stream/VC entry base.
+- `GetStreamVcEntryDisplayRecord(entry)` returns `entry+0x350`.
+- Therefore the precheck's `+0x10` load is `display_record+0x10`, a back-pointer to the owning stream/VC entry.
+- That back-pointer is initialized in both stream/VC construction paths:
+  - `0x1414F18EE`: `display_record+0x10 = entry`;
+  - `0x1414F1B7A`: `display_record+0x10 = entry`.
+
+Resolved precheck chain:
+- `StreamVcEntryEnablePrecheckByDisplayIndex` at `0x1414F4FC0`:
+  - `vc_manager = *(manager+0x3F0)`;
+  - `display_record = FindStreamVcEntryByDisplayIndex(vc_manager, display_index)`;
+  - `entry = *(display_record+0x10)`;
+  - `mapped_sink = entry->vfunc+0xA0()`;
+  - `flags = mapped_sink->vfunc+0x50()`;
+  - return `flags & 1`.
+- Entry vfunc `+0xA0` is `StreamVcEntryGetMappedEmulatedSink` at `0x141573B10`; it returns `entry+0x3A8` / `+936`.
+- Entry vfunc `+0xE8` is `StreamVcEntrySetMappedEmulatedSink` at `0x141573AB0`; it stores the mapped object into `entry+0x3A8` / `+936`.
+
+Resolved backing object:
+- `FindEmulatedSinkListEntryByGuid` at `0x1414F05D0` scans the manager's `All_MstDevices` collection at `manager+0x488` / `+1160`.
+- The list entry layout used here is:
+  - byte `+0`: valid/present marker used by init/redetect paths;
+  - qword `+8`: emulated MST sink object;
+  - bytes `+16...`: sink GUID / RAD-like identity compared by `sub_1414BB7A0`.
+- Non-branch sink restore/list population is in `RestoreNonBranchMstSinkFromRegistry` at `0x1414EFC30`.
+- The object stored at list entry `+8` is created by `CreateEmulatedMstSinkObject` at `0x141576700`, which returns the subobject at allocation `+0x28` / `+40` with vtable `off_141FAE160`.
+
+Resolved object methods:
+- Emulated sink vfunc `+0x30` -> `EmulatedMstSinkGetEmulationMode` at `0x141575740`; returns object `+0xC`.
+- Emulated sink vfunc `+0x50` -> `EmulatedMstSinkGetConnectionStatus` at `0x141574DE0`; copies object `+0x8` into the caller's output flags.
+- Emulated sink vfunc `+0x58` -> `EmulatedMstSinkHasDisconnectedEmulationData` at `0x141575E50`; only true when `ConnectionStatus bit0` is clear and saved/emulated data policy says the object can emulate data.
+- Emulated sink vfunc `+0x60` -> `EmulatedMstSinkHasConnectedEmulationData` at `0x141575D50`; only true when `ConnectionStatus bit0` is set and saved/emulated data policy says the object can emulate data.
+- Emulated sink vfunc `+0x70` -> `EmulatedMstSinkSetConnectionStatus` at `0x141575A80`; updates `ConnectionStatus bit0` from the caller argument and persists/recomputes derived state.
+- Constructor/registry load `sub_141574E10` reads `EmulationMode`, `ConnectionStatus`, `ConnectionProperties`, and emulation data, but then clears `ConnectionStatus bit0` at `0x14157512B`. Restored emulation data alone therefore does not pass stream-enable precheck.
+
+Why this matters:
+- Windows has at least three separate states in this layer:
+  - physical/lower route and AUX/DPCD transport;
+  - stream/VC entry `sink_present` bit at `entry+0x338 bit0`;
+  - mapped emulated-sink object `ConnectionStatus bit0`.
+- The stream-enable wrapper requires the mapped emulated-sink object's `ConnectionStatus bit0` before it even reaches the later `StreamVcEntryIsSinkPresent` validation.
+- The DPCD emulation helpers can skip/fake remote DPCD reads or compare against cached emulation data when the object reports emulation-data availability, but that is not enough for stream enable because the precheck tests `ConnectionStatus bit0` directly.
+
+Updated certainty:
+- Certain: the earlier "entry+0x10 backing object" phrasing was wrong; it is a display-record back-pointer to the owning stream/VC entry.
+- Certain: the stream-enable readiness bit is the emulated MST sink object's `ConnectionStatus bit0`, not raw HPD and not merely the stream/VC `sink_present` bit.
+- Certain: a route/AUX object plus saved emulation data is insufficient unless the mapped emulated-sink object is also marked connected.
+- Linux implication: the closest policy is now more exact:
+  - keep/arm the real `0x3113` route and AUX transport;
+  - preserve the secondary's real logical sink lifetime;
+  - do not allow the exact Apple/tiled secondary to enter the tile-pair stream-enable path unless the Linux state is equivalent to Windows' mapped-sink connected bit, not merely "we still have a DDC route".
+
+New IDA names/comments from this pass:
+- `0x1414F05D0` -> `FindEmulatedSinkListEntryByGuid`
+- `0x1414EFC30` -> `RestoreNonBranchMstSinkFromRegistry`
+- `0x141576700` -> `CreateEmulatedMstSinkObject`
+- `0x1415763D0` -> `EmulatedMstSinkObjectCtor`
+- `0x141574DE0` -> `EmulatedMstSinkGetConnectionStatus`
+- `0x141575740` -> `EmulatedMstSinkGetEmulationMode`
+- `0x141575A80` -> `EmulatedMstSinkSetConnectionStatus`
+- `0x141573B10` -> `StreamVcEntryGetMappedEmulatedSink`
+- `0x141573AB0` -> `StreamVcEntrySetMappedEmulatedSink`
+- `0x1414F0870` -> `FindPendingMstDeviceRecordByGuid`
+- `0x141575E50` -> `EmulatedMstSinkHasDisconnectedEmulationData`
+- `0x141575D50` -> `EmulatedMstSinkHasConnectedEmulationData`
+- Added IDA comments at the display-record back-pointer loads/stores, entry mapped-sink getter/setter, mapped-sink install sites, `ConnectionStatus` getter, constructor bit0 clear, and setter bit0 update.
+
+### Live IDA continuation: who asserts mapped-sink `ConnectionStatus bit0`
+
+Date: 2026-05-24.
+
+Question:
+- The stream-enable precheck requires the mapped emulated-sink object's `ConnectionStatus bit0`. Who actually sets that bit, and does it correspond to HPD, AUX proof, stream/VC sink-present, or generic saved emulation data?
+
+Answer:
+- Static RE found two meaningful ways for the mapped emulated-sink object to become connected:
+  - a detected-sink add path actively sets `ConnectionStatus bit0 = 1` before initializing/mapping the stream/VC entry;
+  - a stream-entry sync path copies `StreamVcEntryIsSinkPresent(entry)` into the mapped object's `ConnectionStatus bit0`.
+- Restore and redetect paths can preserve or clear the bit, but they do not by themselves turn saved emulation data into a durable connected state.
+
+Confirmed active set path:
+- `MstEmuTryAddDetectedSinkAndMarkConnected` at `0x1414F0FD0` is a vtable method on the MST/emulation manager subobject at manager `+0x3B8`.
+- It refuses to proceed if the sink GUID is still in the pending-device record list.
+- It resolves an emulated-sink object by GUID through the manager's object lookup subinterface.
+- At `0x1414F10B5`, it calls emulated-sink vfunc `+0x70` with `(connected=1, mode=0)`, which sets `ConnectionStatus bit0`.
+- It then requires either:
+  - `EmulatedMstSinkHasConnectedEmulationData()` true; or
+  - an already-present stream/VC entry plus either nonzero emulation mode or a higher policy/service flag.
+- If that passes, it calls `MstEmuInitVcEntryForDetectedSink` at `0x1414F11F7`, which sets the stream/VC `sink_present` bit, maps the emulated-sink object into entry `+0x3A8`, and starts the remote DPCD probe state machine through `sub_1414D0120`.
+
+Confirmed stream-entry sync path:
+- `MstEmuSyncMappedSinkConnectionFromVcEntry` at `0x1414F0DD0` reconstructs/looks up the emulated-sink object for an existing stream/VC entry.
+- At `0x1414F0ED7`, it reads `StreamVcEntryIsSinkPresent(entry)`.
+- At `0x1414F0EF7`, it calls emulated-sink vfunc `+0x70` with that value, so the mapped object's `ConnectionStatus bit0` becomes a mirror of `entry+0x338 bit0`.
+- It then maps the emulated-sink object back into `entry+0x3A8`.
+
+Confirmed clear/preserve paths:
+- `MstEmuRedetectSinkAndMapVcEntry` at `0x1414F1420`:
+  - clears both stream/VC `sink_present` and mapped-sink `ConnectionStatus bit0` on failed redetect (`0x1414F1524` and `0x1414F153F`);
+  - on an existing entry that still has usable connected/disconnected emulation data, it re-applies the existing `ConnectionStatus bit0` value at `0x1414F162B`;
+  - for a newly-created VC entry, it first clears mapped-sink `ConnectionStatus bit0` at `0x1414F17AF`, then separately sets stream/VC `sink_present` at `0x1414F184C` and maps the object at `0x1414F18C4`.
+- `MstEmuInitVcEntryForDetectedSink` at `0x1414F1960` marks the stream/VC entry sink-present and maps the emulated-sink object, but does not itself set mapped-sink `ConnectionStatus bit0`.
+- `RestoreNonBranchMstSinkFromRegistry` may transiently call the setter with `connected=1`, but that branch immediately calls it again with `connected=0`; registry restore/list population does not leave the mapped sink connected.
+
+Updated certainty:
+- Certain: mapped-sink `ConnectionStatus bit0` is not just "saved emulation data exists".
+- Certain: Windows can assert it from a detected-sink path before stream/VC init, and can later synchronize it from stream/VC `sink_present`.
+- Certain: redetect/preservation paths are mostly about preventing destructive clear or re-applying an existing bit, not inventing connected state without a prior detect/sink-present basis.
+- Linux implication:
+  - preserving `dc_sink` is closest to preserving Windows stream/VC `sink_present`;
+  - keeping the exact `0x3113` AUX route usable is still separate;
+  - the "allow tile-pair stream enable" predicate should be equivalent to: exact route proven, logical secondary sink preserved/present, and no pending false-disconnect teardown. It should not be based on EDID cache alone.
+
+New IDA names/comments from this pass:
+- `0x1414F0FD0` -> `MstEmuTryAddDetectedSinkAndMarkConnected`
+- `0x1414F0DD0` -> `MstEmuSyncMappedSinkConnectionFromVcEntry`
+- `0x1414F1420` -> `MstEmuRedetectSinkAndMapVcEntry`
+- `0x1414F1960` -> `MstEmuInitVcEntryForDetectedSink`
+- Added comments at the connected setter call, stream-entry sync setter call, redetect clear/preserve calls, new-entry clear, and init/map sites.
+
+### Live IDA continuation: primary tile metadata and `config+0x20`
+
+Date: 2026-05-26.
+
+Question:
+- Does Windows make the iMac19,1 primary/root tile-aware by forcing a fresh eDP/root EDID read, or does it construct the primary tile metadata from a grouped/root object while only re-reading the secondary?
+- What exactly is the `service a7` / `config+0x20` object previously flagged as the next object to identify?
+
+Result:
+- The loaded modern BootCamp driver is `B416406\amdkmdag.sys.i64`.
+- `ConstructDisplayCapabilityService()` is present at `0x1415DC180`.
+- `CreateDisplayCapabilityServiceInterface()` calls it from two display-construction paths:
+  - `0x1414B5353` in `sub_1414B5210`, with final argument `0`;
+  - `0x1414B749D` in `ConstructDisplayObjectAndStreams`, with final argument `*(path_config + 0x20)`.
+- In the main display-object construction path, `path_config+0x20` is not a peer/group metadata object. It is filled from the final class-3 display-map entry:
+  - `sub_1414B6380` reaches a class-3 object id, such as the leaf display endpoint;
+  - it uses the matching display-map entry;
+  - it stores `display_map_entry[3]` / `display_map_entry+0x18` into `path_config+0x20`.
+- `ConstructDisplayCapabilityService()` then stores that final argument at `service+0x50`.
+- Therefore `service a7` / `config+0x20` is the endpoint-local lower AUX/DPCD backend for the leaf display object. It can be the root/eDP endpoint or the secondary DP endpoint depending on which object is being constructed, but it is not a single grouped object that manufactures peer tile metadata.
+
+Endpoint tile metadata correlation:
+- `UpdateEndpointModesAndTiledMetadataAfterPinAttach()` still calls `PopulateEndpointTileMetadataFromDisplayIdTopology()` for the selected display endpoint.
+- `PopulateEndpointTileMetadataFromDisplayIdTopology()` obtains tile topology through the display object's own EDID/DisplayID parser vtable slot `+0x158`.
+- `WindowsDM_CopyEndpointTileMetadataByDisplayId()` copies the endpoint's own `display_obj+0x90+0x98` block and returns false if that endpoint token is absent.
+- No peer-clone path was found in this pass.
+
+EDID-payload update path:
+- `WindowsDM_ApplyEdidPayloadAndRefreshDisplay()` at `0x141A1C2D0` applies an EDID payload to one display index, calls `ParseEdidAndPinCapsIntoDcSinkInfo()`, then calls `ApplyEdidPayloadAndRebuildDcSinkForDisplay()`.
+- After that, it calls the normal endpoint update path again:
+  - `RefreshDisplayTileActiveFromMetadataFlags()`;
+  - `sub_141A07ED0(...)`;
+  - `sub_141A064F0(...)`.
+- This means Windows' explicit EDID-payload path rebuilds the sink and tile metadata for the selected display object itself. It is still endpoint-local.
+
+Updated answer to the primary question:
+- Static RE now leans strongly away from "Windows constructs the primary tile purely from the secondary/root group without primary endpoint tile metadata."
+- The normal Windows grouped-validation model expects both endpoints to have their own DisplayID-derived tile metadata.
+- The remaining unknown is runtime ordering: for iMac19,1 plain BootCamp boot, does Windows actually force a fresh primary/eDP EDID read so the primary endpoint obtains tile-aware DisplayID, or does the primary already have tile-aware EDID by the time this display-object update path runs?
+- `config+0x20` no longer looks like the unresolved magic grouped object. It is the per-endpoint lower AUX/DPCD backend, so a forced refresh can in principle target either primary or secondary as separate endpoints.
+
+Linux implication:
+- Best target remains to get both Linux connectors into endpoint-local tile metadata:
+  - primary `0x3114` must have real or narrowly reconstructed `0,0 / 2560x2880` tile metadata;
+  - secondary `0x3113` must have real `1,0 / 2560x2880` tile metadata from its own route/EDID when possible;
+  - any Linux synthesis of primary or secondary TILE should be labeled as a compatibility fallback, not as behavior proven in the Windows normal path.
+- The cheapest empirical test is still valuable: after the primary `0x4F1` wake and successful secondary EDID read, force/retry a primary eDP EDID read and log whether the primary changes from the 4K/no-TILE `APP/AE25` style state to a tile-aware DisplayID state.
+
+New IDA names/comments from this pass:
+- `0x1415CFE30` -> `DisplayCapabilityService_GetCapabilityMask8`
+- `0x1415D4C40` -> `DisplayCapabilityService_RefreshEdidOverrideAndCaps`
+- `0x141A1C2D0` -> `WindowsDM_ApplyEdidPayloadAndRefreshDisplay`
+- `0x141A06AE0` -> `WindowsDM_RemoveSinkFromMapByIndex`
+- Added comments at `0x1414B6622`, `0x1414B749D`, `0x1415DC221`, `0x1415D4CA6`, `0x141A1C4AF`, and `0x141A1C61C`.
+
+### Live IDA continuation: physical EDID read versus endpoint-local EDID fixups
+
+Date: 2026-05-26.
+
+Question:
+- Does the modern BootCamp path prove that `APP/AE25` / `APP/AE26` force a fresh primary/root physical EDID read?
+- Or do those Apple panel capabilities only affect the higher-level EDID/pin-cap/tile parsing path after an EDID buffer already exists?
+
+Result:
+- The string `Forced EDID read.` is in `EdidReader_RefreshMaybeForced()` at `0x141550DC0`.
+- That function has two ways to perform a physical EDID refresh:
+  - capability check `HasCapability(37)` / `0x25` succeeds, so it reads EDID even without the explicit force argument;
+  - explicit force argument `a2` is set, so it calls the hardware EDID reader and logs `Forced EDID read.`.
+- The physical read helper is `EdidReader_ReadEdidBlocksFromHardware()` at `0x141550880`.
+  - It first tries DDC address `0x52`.
+  - If that does not produce a valid EDID-like block, it scans addresses `0x50..0x52`.
+  - The block read path goes through `EdidReader_ReadOneEdidBlock()` at `0x14154FA30`, which performs the actual segmented EDID/I2C-style transactions.
+- This physical-read path is endpoint-local: it acts on the EDID reader/backend object it is called on. It is not a primary-from-secondary or secondary-from-primary TILE reconstruction path.
+
+Important split from the Apple capability path:
+- `APP/AE25` and `APP/AE26` are still proven vendor/product capability records, but they map through `MapCapabilityTableIdToPinPropertyTag()` as:
+  - source id `0x38` -> pin property tag `0x3A`;
+  - source id `0x39` -> pin property tag `0x3B`.
+- The forced physical EDID-reader capability check is for id/tag `37` / `0x25`.
+- This pass did not find static evidence that the `APP/AE25` or `APP/AE26` rows themselves set capability `0x25`.
+- Therefore, the `APP/AE25` / `APP/AE26` rows are proven to drive the endpoint-local pin-cap/EDID-fixup/tile parsing path, but they are not yet proof that Windows physically re-reads the primary/root EDID.
+
+Higher-level endpoint-local fixup paths:
+- `ConstructDisplayPinFromEdidApplyVendorCaps()` constructs a pin from a supplied EDID buffer, applies the vendor/product capability table, and immediately runs `ApplyPinCapabilityEdidFixups()` if any pin-cap records exist.
+- `ApplyPinCapabilityEdidFixups()` dispatches tags `0x3A` and `0x3B` to `DoubleEdidPhysicalWidthForTiledCaps()`. This is the known Apple/tiled EDID geometry fixup, not a hardware re-read.
+- `WindowsDM_ReadType128EdidWithPinCapabilityFixups()` applies the same pin-cap EDID fixup path to the selected display object's type-128/internal EDID buffer.
+- `DisplayCapabilityCache_RefreshBaseEdidWithFixups()` / `RefreshEdidCacheApplyPinCapabilityFixups()` refresh cached parsed EDID objects and applies fixups to that endpoint's raw/cached EDID buffer; it also does not by itself prove a new physical EDID transaction occurred.
+- `UpdateEndpointModesAndTiledMetadataAfterPinAttach()` constructs a pin from this display object's current EDID/mode block, then calls `PopulateEndpointTileMetadataFromDisplayIdTopology()` for the same display index. No peer clone was found here either.
+
+Updated answer:
+- More certain: Windows' normal TILE metadata path is endpoint-local. The primary/root tile is not visibly manufactured from the secondary tile's DisplayID block.
+- More certain: AE25/AE26 explain the Apple/tiled EDID fixup and pin-cap path, but do not by themselves prove the physical primary re-read trigger.
+- Still unresolved: at runtime on iMac19,1, the primary may become tile-aware because:
+  - the panel/firmware changes what the primary EDID reader returns after the root `0x4F1` wake;
+  - another policy sets the explicit-force or capability-`0x25` physical EDID-read path for the primary;
+  - the primary was already represented by a tile-aware/type-128 internal EDID buffer before the mode/tile update runs.
+
+Linux implication:
+- Keep the forced primary EDID re-read experiment. It is now clearly Windows-shaped because Windows has a real per-endpoint physical EDID reader that can be forced, even though AE25/AE26 do not prove when it is invoked.
+- If the primary re-read flips to tile-aware `0,0 / 2560x2880`, Linux should use the real primary EDID/TILE.
+- If the primary re-read remains 4K/no-TILE while the secondary has real `1,0 / 2560x2880`, Linux will need a narrowly gated primary TILE reconstruction fallback. That fallback should be documented as a Linux compatibility step, not as behavior proven to be Windows' normal path.
+
+New IDA names/comments from this pass:
+- `0x141550DC0` -> `EdidReader_RefreshMaybeForced`
+- `0x141550880` -> `EdidReader_ReadEdidBlocksFromHardware`
+- `0x14154FA30` -> `EdidReader_ReadOneEdidBlock`
+- `0x1415E8780` -> `DisplayCapabilityCache_RefreshBaseEdidWithFixups`
+- Added comments at `0x141550E0F`, `0x141550F13`, `0x1415508DC`, `0x1415E87B1`, `0x141A0FAC0`, and `0x141A2227D`.
+
+### Live IDA continuation: EDID-reader call surface and pin-cap pipeline integration
+
+Date: 2026-05-26.
+
+Questions:
+- Does Windows call the `Forced EDID read.` / `EdidReader_RefreshMaybeForced()` path from the iMac 5K detect/update path, and if so when and for which tile?
+- How is the pin-cap EDID fixup path integrated, and what should Linux copy from it?
+
+Result: two EDID readers must be kept distinct.
+
+Physical/forced EDID reader:
+- `EdidReader_RefreshMaybeForced()` at `0x141550DC0` is a vfunc on the per-object DPCD/AUX wrapper vtable `off_141FAC048`, slot `+0x60`.
+- It can perform a hardware EDID refresh when:
+  - capability `37` / `0x25` is present; or
+  - its explicit force argument is set, which logs `Forced EDID read.`.
+- The wrapper is endpoint-local. `CreateDpcdAuxInterfaceForObjectId()` constructs it for a concrete AMD object id and returns the `+0x28` subobject stored at display-map entry `+0x18`.
+- Therefore, if this vfunc is called on an iMac 5K endpoint, it would target whichever concrete wrapper is selected: primary/root `0x3114` or secondary `0x3113`. It is not intrinsically a grouped/two-tile operation.
+- Static xrefs still show no direct code caller for `EdidReader_RefreshMaybeForced()`; its only meaningful reference is the vtable entry. A byte/instruction scan for direct virtual-call slot `+0x60` candidates did not find a concrete 5K detect/update caller.
+
+Normal DC detect EDID reader:
+- The actual `DcLinkDetectHelper` path reaches:
+  - `ReadEdidIntoDcSinkThroughPin()` at `0x141EDDD50`;
+  - `sub_1419FF3A0()`;
+  - `ReadEdidAndPopulateDcSink()` at `0x141BB2E70`;
+  - `DdcService_ReadEdidBlocksForDetect()` at `0x141BB1E60`;
+  - `DdcService_ReadOneEdidBlockWithRetries()` at `0x141BB2590`.
+- This normal path first tries address `0x52`, then falls back to `0x50` and extension reads.
+- The low-level block read chooses:
+  - `DdcService_ReadEdidBlockAux()` at `0x141BB2860`; or
+  - `DdcService_ReadEdidBlockI2c()` at `0x141BB2650`;
+  - up to seven retries per EDID block.
+- After the EDID bytes are obtained, `ReadEdidAndPopulateDcSink()` calls `ParseEdidAndPinCapsIntoDcSinkInfo()`, which constructs the same capability-aware pin/parser path used elsewhere.
+
+Answer to "when and which tile":
+- For the traced Windows 5K-relevant detect path, the EDID read is the normal DDC-service read, not the `Forced EDID read.` vfunc.
+- The read is endpoint-local: when the active link/display object is `0x3113`, it reads the secondary endpoint; when it is `0x3114`, it reads the primary endpoint.
+- This pass did not prove that Windows forces a physical primary/root EDID re-read during iMac19,1 5K bring-up. The forced reader remains a real Windows-shaped mechanism, but it is not the normal `DcLinkDetectHelper` EDID path we traced.
+
+Pin-cap/fixup pipeline integration:
+- `ConstructDisplayPinFromEdidApplyVendorCaps()` is the central path:
+  1. copy supplied EDID bytes into the pin object;
+  2. run `ApplyVendorProductCapabilityTableToPin()`;
+  3. convert table source ids through `MapCapabilityTableIdToPinPropertyTag()`;
+  4. insert pin-cap records and set descriptor bits through `SetPinDescriptorCapabilityBitById()`;
+  5. run `ApplyPinCapabilityEdidFixups()` if any records exist;
+  6. create the EDID parser chain from the already-fixed EDID bytes.
+- For modern Apple panel ids:
+  - `APP/AE25` maps source id `0x38` to pin property tag `0x3A`;
+  - `APP/AE26` maps source id `0x39` to pin property tag `0x3B`.
+- `SetPinDescriptorCapabilityBitById()` maps those tags to descriptor byte `+6`:
+  - tag `0x3A` -> byte `+6`, bit `2`;
+  - tag `0x3B` -> byte `+6`, bit `3`.
+- Those same descriptor bits are later consumed by the `0x4F1` paths:
+  - detect/status-time writer accepts tag `0x3A` / byte `+6 bit2`;
+  - stream-enable writer accepts tag `0x3A` or `0x3B` / byte `+6 bit2` or `bit3`.
+- The concrete EDID mutation for tags `0x3A`/`0x3B` is only `DoubleEdidPhysicalWidthForTiledCaps()`:
+  - if EDID byte `21` horizontal physical size is less than byte `22` vertical size and less than `0x80`, double byte `21`;
+  - recompute EDID block-0 checksum;
+  - do not alter modes, preferred timing, or DisplayID TILE payload.
+- `WindowsDM_ReadType128EdidWithPinCapabilityFixups()` and `DisplayCapabilityCache_RefreshBaseEdidWithFixups()` reuse this same endpoint-local fixup model for cached/type-128 EDID buffers.
+
+Linux implication:
+- Linux should apply any Apple/tiled pin-cap-equivalent EDID fixup before EDID/DisplayID parser use, not after TILE metadata has already been derived.
+- For AE25/AE26, the Windows-proven fixup is narrow: physical-width byte correction plus checksum only.
+- Linux should keep the forced primary EDID re-read experiment as an empirical probe, but should not treat it as proven Windows runtime behavior from this RE pass.
+- If the primary EDID does not become tile-aware after wake/re-read, a Linux primary TILE reconstruction fallback is still plausible, but it should be documented as a compatibility fallback rather than claimed as Windows' normal mechanism.
+
+New IDA names/comments from this pass:
+- `0x141BB1E60` -> `DdcService_ReadEdidBlocksForDetect`
+- `0x141BB2590` -> `DdcService_ReadOneEdidBlockWithRetries`
+- `0x141BB2650` -> `DdcService_ReadEdidBlockI2c`
+- `0x141BB2860` -> `DdcService_ReadEdidBlockAux`
+- Added comments at `0x141BB2EC4`, `0x141BB1EE2`, `0x141BB2143`, `0x141BB25C7`, `0x141BB25F0`, `0x141BB2613`, `0x141550DC0`, `0x141A9F483`, `0x141A9F539`, and `0x141A45922`.
+
+### Live IDA continuation: what replaces primary 4K/no-TILE state
+
+Date: 2026-05-26.
+
+Question:
+- Can more RE tell us whether Linux needs a real new primary EDID, or whether it can construct the primary tile state when the primary still reports the plain 4K/no-TILE EDID?
+
+Result:
+- The downstream Windows SetMode/tile-split consumers make the primary requirement clearer.
+- Windows does **not** appear to have a downstream repair path that says "if primary has no TILE, borrow the secondary TILE and continue."
+- But Windows also does **not** require the raw EDID mode list to literally contain `2560x2880`. It has a derived-mode path that can inject the physical half-tile mode when the endpoint has the right tile/timing flags.
+
+Primary endpoint TILE is required:
+- `PopulateEndpointTileMetadataFromDisplayIdTopology()` is called from `UpdateEndpointModesAndTiledMetadataAfterPinAttach()` for the selected display endpoint.
+- If that per-endpoint DisplayID tiled-topology parse succeeds, Windows writes the endpoint tile block at `display_obj+0x90+0x98`.
+- If it fails, `UpdateEndpointModesAndTiledMetadataAfterPinAttach()` zeroes the endpoint tile block.
+- `WindowsDM_CopyEndpointTileMetadataByDisplayId()` is the concrete vfunc `+0x2C8` implementation. It returns false if that endpoint tile block token is missing.
+- `SetMode_FindTileGroupAnchorDisplay()` requires vfunc `+0x2C8` to return tile metadata for the first endpoint and for every peer endpoint.
+- `ValidateDisplaysShareTiledGroupMetadata()` also requires:
+  - a nonzero tile metadata token on each endpoint;
+  - matching group token across endpoints;
+  - grid product equal to the active display count;
+  - coverage of all tile slots.
+- `BuildSourceModeForTileSplitPath()` disables its tile-split branch when it cannot find a peer display with matching tile-group metadata.
+
+Mode can be derived:
+- `ModeManagerAddDerivedModesIncluding5kTile()` can inject the `2560x2880` physical half-tile mode.
+- The path depends on:
+  - mode-manager pipe/tile option flags;
+  - a timing/mode record flag bit7 set by `MarkTimingPipeSplitForHighResAnd5k60()` or `MarkModeRecordIfTileAspectCompatible()`;
+  - base timing shape `1920x2160`;
+  - `DalEnable5kTiledMode` for the final `2560x2880` injection.
+- Therefore Windows can get the half-tile mode through derived-mode logic, not necessarily because the raw EDID directly advertised `2560x2880`.
+
+Updated certainty:
+- Certain: the primary tile group token cannot be missing by the time Windows grouped SetMode validates the pair.
+- Certain: Windows does not downstream-copy the secondary tile token into a missing primary tile block in the traced path.
+- Certain: raw EDID modes and endpoint TILE metadata are separate problems. The half-tile mode can be derived, but the tile metadata still has to exist per endpoint.
+- Still unresolved: at runtime, how the iMac19,1 primary endpoint obtains the tile metadata if a plain physical eDP EDID read returns 4K/no-TILE:
+  - physical primary EDID changes after root `0x4F1` wake and a re-read;
+  - a type-128/internal mode/EDID buffer already contains primary tile metadata;
+  - or Windows gets a firmware/driver-provided primary tile block before this update path.
+
+Linux implication:
+- A forced primary EDID re-read after wake is still the cleanest empirical test. If it returns real primary DisplayID TILE, Linux should use it.
+- If the primary still returns only 4K/no-TILE, Linux should not wait for EDID fixups to create TILE. The Windows-proven pin-cap fixup does not do that.
+- The likely Linux fallback shape is:
+  - keep the real primary route `0x3114`;
+  - keep the real secondary route `0x3113` and real secondary EDID/TILE when available;
+  - synthesize only the missing primary endpoint TILE metadata as left tile `0,0 / 2560x2880`, same group token as the proven secondary, and only for the exact Apple internal route;
+  - ensure the primary exposes/keeps a valid `2560x2880` mode, either from a real EDID re-read or as a narrow derived-mode/fallback mode;
+  - label this as a Linux compatibility fallback unless a later runtime trace proves Windows also constructs primary TILE from a non-EDID source.
+
+New IDA comments from this pass:
+- Added comments at `0x141A0FBF1`, `0x141A0FC75`, `0x141A0FCDB`, `0x141A3C8A9`, `0x141A3C884`, `0x14140BD5B`, `0x141507BD0`, and `0x141A75931`.
+
+### Kernel change: Change A — forced primary EDID re-read (the empirical test of ss5936)
+
+Date: 2026-05-26.
+
+This implements the "cleanest empirical test" called for above (ss5936, "A forced primary EDID re-read after wake"): determine at runtime whether the iMac19,1 primary endpoint `0x3114` obtains real DisplayID TILE when re-read after the secondary `0x3113` has latched the panel into tile mode, or whether it keeps returning plain 4K/no-TILE (`0xAE25`).
+
+Implementation: `amdgpu_dm_imac5k_reprobe_primary_after_secondary()` in `amdgpu_dm.c`, called once at the end of `amdgpu_dm_initialize_drm_device()` after the boot detect loop. Gated to DMI `iMac19,1` + exact primary/secondary routes; only fires when the secondary actually carries the TILE; idempotent (skips if the primary is already tile-aware). Logs the primary `product/manufacturer_id`, `has_tile`, tile geometry, and the `2560x2880` mode count before and after, tagged `CHANGED`/`UNCHANGED`. We deliberately implemented only Change A (read what the panel returns) and **rejected** Change B (synthesizing the missing primary TILE), since Change B manufactures state Windows was not observed producing; if the probe shows the primary never flips, the per-endpoint-TILE question (ss5936 fallback shape) is revisited with that evidence rather than pre-emptively.
+
+New code-side finding that shaped the mechanism (Linux DC constraint, not a Windows RE finding):
+- DC's `detect_link_and_local_sink()` (link_detection.c) has an **eDP early-out**: when the link already has a `local_sink` and `link->dc->config.allow_edp_hotplug_detection` is false (the default), it returns the cached sink **without re-reading EDID**. So a second `dc_link_detect()` on the primary eDP is a silent no-op for the EDID — it cannot serve as the forced re-read.
+- Forcing the full detect path by flipping `allow_edp_hotplug_detection` is unsafe: `link_detect_connection_type()` then runs the eDP power sequence and, if `link_get_hpd_state()` reads low at that instant, **powers the eDP panel down** (`edp_power_control(link, false)`).
+- Therefore Change A re-reads via `dm_helpers_read_local_edid(link->ctx, link, link->local_sink)` directly. That is the exact reader DC uses inside detect: a real DDC/AUX EDID read that also calls `drm_edid_connector_update()` (refreshing the DRM connector EDID + `has_tile` + tile geometry) and refreshes the DC sink `dc_edid`/`edid_caps` in place — power-neutral, no connection-type/power sequence, cannot disconnect the panel. Change A then resyncs `aconnector->drm_edid` (the cache `amdgpu_dm_connector_get_modes()` consumes) from the freshly read bytes so the two EDID layers stay coherent.
+
+What `new_boot_7` resolves (maps directly to the ss5936 "still unresolved" bullets):
+- `post-reread ... CHANGED ... product=0xae26 has_tile=1` ⇒ bullet 1 is true: the physical primary EDID does change after the root `0x4F1` wake + re-read. Linux should use the real primary TILE; the tile pair can form with the existing pieces.
+- `post-reread ... UNCHANGED ... product=0xae25 has_tile=0` ⇒ bullet 1 is false for a pure software re-read: the primary endpoint does not expose TILE over a plain eDP EDID re-read. Then the remaining options are the type-128/internal buffer or firmware-provided primary tile block (bullets 2/3), or the labelled compatibility fallback (ss5936 "likely Linux fallback shape") — to be decided with this evidence.
+
+## new_boot_7 RESULT: STAGE 2 WORKS — NATIVE 5K ON PLAIN BOOT
+
+Date: 2026-05-26. Kernel `7.0.1-1-imac-5k-g066b89c6f6da`.
+
+**ss5936 bullet 1 is TRUE.** The forced primary re-read flips the primary endpoint exactly as hoped, and the full tile pair forms. Plain-boot Linux (systemd-boot, no OCLP/firmware helper) now brings up native 5K `5120x2880` with no manufactured state.
+
+Proven chain, in boot order:
+- Primary flip (Change A): `primary 0x3114 pre-reread product=0xae25 has_tile=0` ext `tag=0x02 (CEA-861)` ⇒ `post-reread product=0xae26 has_tile=1 tile=2560x2880 loc=0,0 grid=2x1 ... CHANGED` ext `tag=0x70 (DisplayID)`. Raw bytes confirm it on the wire: id8_23 `... 25 ae ...` → `... 26 ae ...`. `drm_edid_connector_update [eDP-1] tile cap 0x82 size 2560x2880 location 0x0`. So the panel really does hand the eDP endpoint a DisplayID-TILE EDID once the secondary has latched it; Linux did not synthesize anything.
+- Both endpoints now have complementary TILE in the same group: primary eDP-1 = left `loc 0x0`, secondary DP-1 = right `loc 1x0`, grid `2x1`, `tile_group=...b364f8e1`.
+- `make-tile-preferred` fires on both: `eDP-1 tile mode 2560x2880 set as sole preferred` + `DP-1 ... set as sole preferred` (4K kept, not preferred).
+- DRM forms the tile group: `[eDP-1] found tiled mode: 2560x2880` (tile 0) + `[DP-1] found tiled mode: 2560x2880` (tile 1).
+- Secondary link trains at HBR2 x4: after one AUX doze (`-5` burst + DC `*ERROR* dpcd_set_link_settings`), the re-wake retry recovers — `link-config writes OK after re-wake retry attempt=1 rate=0x14 lanes=4`; stream-enable `0x4F1` latch verified.
+- Genlock: `timing-sync result ... group_size=2 master=1` for `0x3114`, `master=0` for `0x3113`; `GSL: Set-up complete`; `dc_commit_state {2560x2880, 2720x2962@483250Khz}` x2 pipes.
+- Modeset: `crtc-0 desired mode 2560x2880 set (0,0)` + `crtc-1 ... set (2560,0)` ⇒ **`fbdev_probe: surface width(5120) height(2880) bpp(32)`**. Stable through every re-probe to t=221s (tail is only routine `dc_allow_idle_optimizations` idle ticks — no teardown, no AUX death, no collapse to 4K/640x480).
+
+Remaining items were cosmetic only (do not block 5K) and are now ADDRESSED in code (pending next-boot confirmation of clean logs):
+1. AUX `-5` retry storm at t≈7.8-8.06 before the first link-config write succeeded. Recovered by the existing re-wake-on-failure retry, but noisy (12x `Too many retries -5` + 3 DC `*ERROR*`). FIX (link_dp_training.c `dpcd_set_link_settings`): on the exact iMac secondary route, pre-wake the panel via primary `0x4F1` + 60ms settle BEFORE the first `0x107/0x101/0x100` write, so the first attempt lands cleanly; the re-wake-on-failure retry stays as the safety net. Success log reworked to `link-config writes OK ... (pre-wake done; re-wake retries=N)` (N=0 means the pre-wake sufficed). New first line to expect: `secondary 0x3113 pre-waking panel via primary 0x4F1 before first link-config write`.
+2. Misleading log: `link-cap NOT bridged ... 2560x2880 will still be pruned` printed even when `verified rate=0x14 lanes=4` was already HBR2 x4 (real training succeeded, nothing pruned). FIX (link_dp_capability.c bridge `else`): split into (a) reported known but not better => `link-cap bridge not needed: verified cap already adequate ... 2560x2880 not pruned`; (b) reported unknown => `link-cap NOT bridged: reported caps unknown (AUX read failed) ... may still be pruned`. The actual bridge logic is unchanged.
+
+This supersedes the older "Stage 2: 4K fallback" framing: plain boot no longer drops to 4K. The genlock/timing-sync, reported-cap bridge, make-tile-preferred, secondary wake/AUX/retry, and Change A primary re-read together produce the two-tile `2560x2880 + 2560x2880` topology = one logical `5120x2880`.
