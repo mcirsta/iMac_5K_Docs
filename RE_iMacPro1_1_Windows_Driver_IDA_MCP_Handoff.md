@@ -29,6 +29,87 @@ Important: do not treat "iMacPro1,1 is in the table" as proof that the panel
 enable sequence is complete. The logs show ID detection works; the visible
 failure appears to be later, in panel/tile-controller state.
 
+## 2026-06-04 Static RE Update
+
+The working Pro1,1 VBIOS artifact `imacpro11-vbios.rom` removes the earlier raw
+source-ordinal uncertainty:
+
+- VBIOS part `113-D05001A1XT-018`, SHA256
+  `73AE9942052F17F6E1201409C3C55C98962A5050362D55E3D8E378CE936F16F8`.
+- ATOM display object info table revision `1.4`, offset `0x83c`.
+- Pro1,1 root/eDP `0x3114 -> raw encoder 0x2221 -> Windows source 5`.
+- Pro1,1 slave/DP `0x3113 -> raw encoder 0x2121 -> Windows source 4`.
+- Known-good iMac19,1 differs: `0x3114 -> 0x2120 -> source 2` and
+  `0x3113 -> 0x2220 -> source 3`.
+
+Therefore the next RE/patch target is no longer another `0x310 = 04/05 1d 03`
+attempt. Check the final Linux source-role/source-control path against the
+confirmed Pro1,1 DCE12 source pair `5/4`, including peer object state and any
+remaining ASSR/MSA/`0x316` branch only after source `5/4` is aligned.
+
+Additional IDA pass result: the previously listed stream/link context `+0x98`
+"source-manager" target is now resolved and renamed in the IDB. It is actually
+the topology-manager full `+0x38` notification interface. The peer-refresh
+vfuncs called by `ProgramPeerSourceUpdateBeforeStreamEnable()` are:
+
+- `+0x40`: `TopologyNotifyPreStreamDisableForDisplay()`.
+- `+0x48`: `TopologyNotifyPostStreamDisableForDisplay()`.
+- `+0x50`: `TopologyMaybeIssuePplibCmd38ForDisplay()`.
+- `+0x58`: `TopologyNotifyPostStreamEnableForDisplay()`.
+
+The optional callback issues display-power-policy/PPLIB command `38` with no
+payload. This peer-refresh path is order-sensitive, but it does not consume
+source masks, preferred source, or `role_payload[0]`. Do not treat it as the
+remaining source-ordinal explanation.
+
+Additional path-order result: `DisplayObject_AddPathInterface()` stores paths in
+a two-slot per-display stream array, and the final payload collector scans from
+stream index `0` upward. The peer getter is only `index + 1`, with no wrap. Both
+the Pro1,1 v1.4 ROM and the known-good iMac19,1 v1.3 ROM use direct
+one-encoder-per-endpoint Apple paths, so this currently does not look like a
+Pro-only peer-order fork. If no `index + 1` path exists, `role_payload[5]`
+falls back to the base display object id.
+
+Latest stream-DPCD/mode result:
+
+- `WriteDpStreamCapsSourceDpcd310_0204Flag()` writes DPCD `0x310` as
+  `02 04 <flag>`, not the pre-training `04/05 1d 03` payload. `<flag>` is
+  `DalSupportExternalPanelDrr` option id `788` AND base signal type `>= 11`.
+  The option table default is true and it is not version-gated, so both DCE11
+  and DCE12 DP/eDP-style paths should normally produce `02 04 01`.
+- The companion DPCD `0x300` word comes from CBasePin capability-name property
+  id `19`; it is a pin/capability value, not source index.
+- The generic stream-enable finalizer chooses `0x107` vs `0x170` based on
+  parsed converter capability byte `stream+0x36C`. No converter data means the
+  no-converter path calls `LinkServiceSyncMsaTimingIgnoreOnDpcd107()`.
+- The `0x107` writer sets bit 7 when `stream+0x5C/+0x60` is nonzero. Since
+  `stream+0x5C` comes from `path_record[13] =
+  PackDisplayObjectIdCoreFields(0x3114/0x3113)`, Windows should set
+  `0x107[7]` on real Pro1,1 streams.
+- `0x316` is only written inside `StreamEnableWrite4F1AndPollSinkStatus()`,
+  the mode-11 immediate worker. It is not emitted by the generic cached
+  finalizer.
+- `UpdateMode11ImmediateStreamEnableFlag()` sets immediate mode only for
+  display-object mode `11`. Raw mode `12` clears the immediate flag. The
+  display-object mode getter reports committed signal type `12` as `11` only
+  when byte `+0x1E9` is set. The setter is
+  `DisplayObject_SetSignal12ReportsAs11Flag()` at `0x141547CB0`, vtable slot
+  `+0x318`, reached from the SetMode MST-to-SST optimization path.
+
+This makes the DCE11/DCE12 mode split a real divergence: iMac19,1 naturally
+enters the mode-11 immediate/latch worker, while Pro1,1/DCE12 falls through the
+generic no-converter finalizer unless SetMode explicitly coerces `12 -> 11`. Do
+not assume that a Linux Pro1,1 fix should replay the iMac19,1 `0x316`/`0x4F1`
+timing path.
+
+Local Linux-tree scan: the existing Apple 5K helpers checked in
+`amdgpu_dm.c`, `amdgpu_dm_helpers.c`, `link_dp_capability.c`,
+`link_dp_training.c`, `link_detection.c`, `link_dpms.c`, and
+`link_edp_panel_control.c` still gate on the iMac19,1 route
+`DDC 3/2 + UNIPHY_C/D`. A Pro1,1 route variant should gate root/eDP on
+`0x3114 + UNIPHY_F/source 5` and slave/DP on `0x3113 + UNIPHY_E/source 4`;
+the Pro1 raw DDC shape is `1/0`, so DDC `3/2` should not be reused.
+
 ## Evidence From Linux Logs
 
 Use these captures first:
@@ -164,26 +245,23 @@ wrong order for Vega/Japura.
 
 Answer these with code evidence from the Windows driver. Avoid hunches.
 
-1. Does the Windows driver write source DPCD `0x310` as `05 1d 03`,
-   `04 1d 03`, or both on iMacPro1,1 / Vega / DCE 12?
-2. If both are used, what decides the value and what is the exact retry/order?
-3. Does Windows write `0x4F1` on the root link, the slave link, or both?
-4. Does Windows write `0x4F1 = 0` before `1`, or pulse `1 -> 0 -> 1`?
-5. Does Windows repeat `0x4F1` after link training or immediately before stream
-   unblank?
-6. Are there required delays after `0x4F1`, after `0x310`, or between enabling
-   the two tile streams?
-7. Does Windows write any additional private DPCD address near this sequence
-   (`0x316`, `0x10A`, `0x111`, `0x205`, or Apple/vendor ranges)?
-8. Does Windows set ASSR / DP eDP config `0x10A` differently for the root and
+1. Does Linux's final DCE12/Vega source-control path program source `5` for
+   root/eDP `0x3114` and source `4` for slave/DP `0x3113`, matching Windows?
+2. Does Linux still inherit any iMac19,1 assumptions: source `2/3`,
+   UNIPHY_C/D, DDC `3/2`, mode-11 immediate/latch behavior?
+3. Does the Pro1,1 path use the Windows-shaped DCE12 stream-enable branch:
+   committed mode `12`, generic cached/no-converter finalizer, and DPCD
+   `0x107[7]`?
+4. Does Linux accidentally depend on Windows' mode-11 immediate worker
+   (`0x316` and old `0x4F1`) even though raw DCE12 mode `12` clears that branch?
+5. Does Windows set ASSR / DP eDP config `0x10A` differently for the root and
    slave routes?
-9. Does Windows treat iMacPro1,1/Japura differently from iMac19,1/Polaris once
-   both tile EDIDs are visible?
-10. Is the stream-enable order root-first, slave-first, or synchronized/grouped?
-11. Is there a grouped-display/tile-controller state structure that must be
-    committed before the planes/streams go live?
-12. Does Windows use a special two-stream timing or timing-sync command even
-    though each stream is nominally `2560x2880 @ 59.98`?
+6. Does Windows use a special two-stream timing or timing-sync command even
+   though each stream is nominally `2560x2880 @ 59.98`?
+7. Is there a grouped-display/tile-controller state structure that must be
+   committed before the planes/streams go live?
+8. After source `5/4` and mode/finalizer are aligned, are there remaining
+   required delays between enabling the two tile streams?
 
 ## IDA Pro + MCP Workflow
 
@@ -212,7 +290,7 @@ Expected outcome:
 Do not stop at a constant hit. Follow xrefs up to the caller that knows the
 display/link role.
 
-### 2. Find Source-DPCD Table Revision Logic
+### 2. Source-DPCD Table Revision Logic Is Mostly Closed
 
 Search byte/constant patterns:
 
@@ -221,16 +299,22 @@ Search byte/constant patterns:
 - DPCD address `0x310`
 - separate constants `0x1d` and `0x03` only after narrowing to DPCD callers
 
-Expected outcome:
+Current result:
 
-- Identify exactly where the Windows driver prepares source-DPCD bytes.
-- Determine whether DCE version, ASIC family, panel ID, connector type, or
-  firmware capability chooses byte 0.
-- Record whether iMacPro1,1/Vega chooses `05` or `04`.
+- The earlier pre-training `04/05 1d 03` path is not the most promising Pro1,1
+  difference.
+- A separate stream-capability writer emits DPCD `0x310 = 02 04 01` by default
+  for DCE11/DCE12 DP/eDP-style paths (`DalSupportExternalPanelDrr` and base
+  signal type `>= 11`).
+- Do not restart broad `0x310` byte guessing unless a later xref proves another
+  Pro1-specific writer.
 
-This is a critical question because Linux originally used a DCE heuristic
-(`DCE_VERSION_12_0 ? 0x05 : 0x04`), then the noisy branch forced `0x04`. We need
-Windows evidence for the correct iMacPro1,1 behavior.
+Next use of this section:
+
+- Keep these constants as search anchors only when checking whether Linux has an
+  extra conflicting write.
+- The more important comparison is now final source `5/4`, mode `12` generic
+  finalizer, and `0x107[7]`.
 
 ### 3. Trace Apple Panel Latch `0x4F1`
 
@@ -384,14 +468,94 @@ APPLE5K: stream-enable root latch 0x4F1
 
 then it did not test the latest stream-enable root-latch patch.
 
+## Current RE State: SetMode Tile Branch
+
+Recent IDA work resolved the main SetMode anchor uncertainty.
+
+- `SetMode_FindMstToSstOptimizationAnchorDisplay()` at `0x141500070` handles
+  single-entry path lists directly and delegates multi-entry path lists through
+  `DSDispatch+0x38`, vtable slot `+0x40`.
+- The delegate resolves to `SetMode_FindTileGroupAnchorDisplay()` at
+  `0x141507AB0`.
+- That delegate verifies tiled displays, common tile-group id, complete tile-grid
+  coverage, and preferred anchor selection via descriptor vfunc `+0x238`.
+- `path_entry+0x18->+0x1C bit7` is the shared timing/path bit used by both
+  `BuildSourceModeForTileSplitPath()` and
+  `SetMode_ApplyMstToSstOptimizationSignalCoercion()`.
+- Bit7 set means the real two-tile source split path. It clears the DCE12
+  `12 -> 11` coercion flag, so Pro1,1 should remain raw mode `12` and use the
+  generic finalizer.
+- Bit7 clear means MST-to-SST optimization/coercion. It sets the `12 -> 11`
+  byte and can send DCE12 through the mode-11 immediate worker.
+
+Practical consequence:
+
+- Do not assume the iMac19,1 `0x316`/`0x4F1` immediate path for Pro1,1. The
+  normal Windows-shaped Pro1,1 path is now more likely source `5/4`, mode `12`,
+  generic no-converter finalizer, and DPCD `0x107[7]`.
+- The next RE target is grouped timing/inter-path sync and final source
+  programming order for DCE12 sources `5/4`.
+
+## Current RE State: Grouped Timing Sync
+
+The grouped timing-sync path is now a concrete Windows behavior.
+
+- `DSDispatch_PrepareSetModeInterPathTimingSync()` at `0x141506BD0` prepares
+  inter-path timing-sync requests after `DSDispatch_BuildApplySetModePaths()`.
+- `SetMode_TimingRecordsMatchForInterPathSync()` at `0x141507350` compares the
+  timing records of candidate paths.
+- Path-state bit `0x8000` marks the timing-server/anchor path.
+- Accepted inter-path setup marks path-state bit `0x20`.
+- `BuildStreamArgForDisplayIndex_SetObject178()` maps that path-state bit into
+  the stream arg.
+- `DSDispatch_ApplySetModeTransition()` calls
+  `SyncManager_ApplySetModeSynchronizationState()` at `0x1414FCEF0` before
+  blank/disable and link enable/unblank.
+- `SyncManager_ApplyInterPathSynchronization()` at `0x1414FBB20` sets
+  `stream_arg+0x168 = 1` for accepted HWSync inter-path clients and for the
+  timing server when a client is paired.
+- The log string confirms this as `HWSyncRequest_Set_InterPath setup`.
+
+Practical consequence:
+
+- After source `5/4` and mode-12/generic-finalizer alignment, the next high-value
+  Linux audit is whether Pro1,1 establishes the equivalent root/slave timing-sync
+  relationship. Missing inter-path/HWSync setup is now a plausible remaining
+  cause of a dual-tile 5K failure.
+
+## Current RE State: Enable / Unblank Order
+
+Enable/unblank order was checked and did not reveal a separate Pro1-only fork.
+
+- `DSDispatch_EnableLinksAndUnblankSetModePaths()` at `0x1415022D0` walks built
+  SetMode paths in ordinal order.
+- Child path-interface calls line up with `EnableLink`, `ChangeMode`, and
+  `UnblankStream`.
+- Path-state bit `0x100000` is the real `SkipEnable` gate and is set by the
+  MST-to-SST optimization path.
+- `DSDispatch_BlankDisableSetModePaths()` at `0x141502C40` walks built paths in
+  list order, while per-display child paths are blanked/disabled in reverse
+  child index order.
+
+Practical consequence:
+
+- The likely Pro1 fix area remains before enable/unblank: source `5/4`, raw
+  DCE12 mode `12` generic finalizer, and grouped inter-path/HWSync setup.
+
 ## Success Criteria
 
 The RE effort succeeds when it can explain, with Windows-driver evidence, at
 least one of these:
 
-- Linux is using the wrong `0x310` bytes for iMacPro1,1.
+- Linux is programming the wrong final DCE12 source ordinal/control path
+  (`5/4` vs inherited iMac19,1 `2/3` assumptions).
+- Linux is following the wrong stream-enable branch for Pro1,1 mode `12`
+  instead of the Windows generic no-converter finalizer with DPCD `0x107[7]`.
+- Linux is using a conflicting or missing stream-capability `0x310` sequence
+  after the decoded Windows baseline `02 04 01`.
 - Linux writes `0x4F1` on the wrong link, at the wrong time, or with the wrong
-  pulse value/order.
+  pulse value/order, but only if Windows RE proves Pro1,1 actually enters an
+  immediate/latch path.
 - Linux is missing another DPCD/private-register write before stream unblank.
 - Linux enables the two tile streams in an order Windows avoids.
 - Linux lacks a Vega/Japura-specific grouped/timing-sync step.
