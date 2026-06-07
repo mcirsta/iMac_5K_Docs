@@ -1296,3 +1296,243 @@ Implication:
   helper id, or final stream-source role payload.
 - Therefore it is lower priority than the now-proven source `5/4` class-9
   helper/HWSync path for explaining why Pro1,1 differs from iMac19,1.
+
+### Phase 6G closeout: tile-split source geometry and source-signal handoff
+
+Date: 2026-06-07
+
+This phase resolves the two candidates from
+`RE_iMacPro1_1_TileSplit_SourceSignal_Handoff.md`. It also corrects the Phase
+6E implication that the HWSync/provider path necessarily performs a Pro1,1
+source-control register adjustment.
+
+#### Candidate B: exact DCE12 register mapping and selector gating
+
+The DCE12 source register base at `unk_141F8CD78` is `0x34c0`. The source
+offset table at `dword_141F8CFA8` is:
+
+`{0x000, 0x100, 0x200, 0x300, 0x400, 0x500}`.
+
+`Dce12SourceSignalEventHandle_ApplySignalTypeToRegs()` at `0x141626820`
+implements only two selector cases:
+
+- Selector `0`: update `DPn_DP_SEC_TIMESTAMP.DP_SEC_TIMESTAMP_MODE` (bit 0)
+  from payload bit 0.
+- Selector `1`: update `DPn_DP_VID_STREAM_CNTL.DP_VID_STREAM_ENABLE` (bit 0)
+  from payload bit 28, then write `DPn_DP_SEC_CNTL` with payload bit 28
+  cleared. In that register, bit 0 is `DP_SEC_STREAM_ENABLE` and bit 28 is
+  `DP_SEC_MPG_ENABLE`.
+- Any other selector returns without a register write.
+
+For the Pro1,1 source pair this maps as follows. Values are dword MMIO
+indices; the Linux header names are relative to the DCE12 segment base:
+
+| Source | Windows index | Linux register |
+|---|---:|---|
+| 4 | `0x51e2` | `mmDP4_DP_VID_STREAM_CNTL` (`0x1d22`) |
+| 4 | `0x5201` | `mmDP4_DP_SEC_CNTL` (`0x1d41`) |
+| 4 | `0x520b` | `mmDP4_DP_SEC_TIMESTAMP` (`0x1d4b`) |
+| 5 | `0x52e2` | `mmDP5_DP_VID_STREAM_CNTL` (`0x1e22`) |
+| 5 | `0x5301` | `mmDP5_DP_SEC_CNTL` (`0x1e41`) |
+| 5 | `0x530b` | `mmDP5_DP_SEC_TIMESTAMP` (`0x1e4b`) |
+
+The critical call-site result is negative:
+
+- The all-DP/MST/eDP branch in
+  `HWSync_AdjustDpMstEdpSourceSignalForInterPath()` passes selector `8`.
+- The mixed-signal branch passes a class helper selector in `9..14`.
+- Provider slot `+0xB0` directly forwards that selector to event-handle slot
+  `+0xB8`; there is no conversion to `0` or `1`.
+- The concrete DCE12 event writer therefore rejects both forms and performs no
+  MMIO for these HWSync calls.
+
+`Dce12SourceObject_ProgramDpSourceIndexMode()` at `0x1416B1D90` does update
+`DPn_DP_SEC_CNTL` during ordinary DP/eDP source programming, but it consumes
+only source index and signal type. It has no tile geometry or inter-path
+special case.
+
+Conclusion: Candidate B does not identify a missing Linux operation. The
+inter-path provider call is structurally present in Windows, but the concrete
+DCE12 implementation makes the inspected tile-pair selector a no-op.
+
+#### Candidate C: tile-split source rectangle construction
+
+`BuildSourceModeForTileSplitPath()` at `0x14140BA40` constructs a local
+source-mode payload and, for a valid two-tile group:
+
+- doubles the aggregate requested source width;
+- halves the per-tile source and horizontal destination/timing geometry;
+- programs the first tile with source X `0`;
+- advances payload offset `+0x114` by the half-width stored at `+0x11c`;
+- resets peer destination/clip X to tile-local zero before programming the
+  second tile.
+
+The rectangle identities are inferred from their initialization and use:
+
+- `+0x114..+0x120`: source rectangle;
+- `+0x124..+0x130`: destination rectangle;
+- `+0x134..+0x140`: clip rectangle.
+
+For a 5120-wide aggregate mode, the second tile is therefore programmed with
+source X `2560` and width `2560`, while its destination and clip remain local
+to that tile.
+
+The current Linux `cold_boot_21` capture already shows the equivalent state:
+
+- both stream source rectangles are local `2560x2880+0+0`;
+- the primary pipe plane source and viewport start at X `0`;
+- the secondary pipe plane source and viewport start at X `2560`;
+- the secondary destination/clip X remains tile-local `0`;
+- both streams participate in one atomic commit and timing synchronization is
+  forced with `ignore_msa=1`.
+
+Conclusion: Candidate C is real Windows tile-split behavior, but its observable
+geometry is already present in the current Linux path. It is a mode/plane
+source-rectangle distinction, not a separate lower DP stream-encoder
+timing/MSA register operation.
+
+#### Patch decision
+
+Neither candidate supports a kernel patch:
+
+- Candidate B is gated out by the concrete DCE12 selector implementation.
+- Candidate C matches the latest Linux capture.
+
+The next Windows comparison should move above the DP source-register writer
+and below the shared mode construction, targeting any panel-private grouped
+display/source-mode object state that survives after the two per-tile
+rectangles have already been formed.
+
+### Phase 6H: Windows non-D0 teardown and warm-reboot handoff
+
+Date: 2026-06-07
+
+This phase follows the WDDM SetPowerState path through DAL, DC, the DCE110
+hardware sequencer, and the DP link power helper. Its purpose is to determine
+whether Windows avoids the stretched next-boot animation by using a different
+generic stream/link shutdown sequence.
+
+#### SetPowerState to empty DC commit
+
+The resolved path is:
+
+```text
+DxgkDdiSetPowerState
+  -> Dispatcher_SetPowerState()                         0x140034130
+  -> Dispatcher_SetPowerStateCore()                     0x140028AB0
+  -> Dispatcher_ApplyAdapterPowerTransition()            0x140027560
+  -> WindowsDM_SetPowerState_ManageDcSeamlessFlags()     0x141A1F9C0
+  -> WindowsDM_DestroyAllDisplayStreams()                0x141A20370
+  -> DcCommitStreams_BuildValidateAndCommit()            0x141B7CE10
+  -> DcApplyValidatedContext()                           0x141B77DF0
+  -> Dce110ApplyContextToHardware()                      0x141CF0690
+  -> Dce110ResetRemovedPipes()                           0x141CEB430
+```
+
+For a non-D0 transition, WindowsDM destroys and clears every display object's
+DC stream, then validates and commits a context with zero streams. The
+generation-specific DCE110 apply callback invokes the removed-pipe reset before
+its stream-count-zero return, so the empty commit still performs full hardware
+teardown.
+
+#### Pipe and link disable order
+
+`Dce110ResetRemovedPipes()` iterates hardware pipe indices `0..5` in ascending
+order. For each old pipe removed from the new context it:
+
+1. calls `LinkSetDpmsOffForPipe()` at `0x141B671C0`;
+2. blanks the timing generator and waits for blank completion;
+3. disables the timing generator;
+4. releases memory-input, clock, audio, and plane resources;
+5. power-gates the removed pipe and clears its stream.
+
+`LinkSetDpmsOffForPipe()` matches Linux `link_set_dpms_off()`:
+
+- DP 1.x SST signal `32` disables the link before the stream to avoid exposing
+  TPS1;
+- the root eDP path takes the alternate stream-before-link ordering;
+- both reach `DisableLinkBySignalType()` at `0x141B6B300`.
+
+The proven Windows ordering is therefore ascending hardware-pipe order, not a
+fixed connector-role or child-list order. The current Linux captures allocate
+the root path to pipe/CRTC 0 and the sibling to pipe/CRTC 1, so root-first is
+the likely consequence for those captures, but static Windows RE does not
+prove that role order for every allocation.
+
+#### DPCD 0x600 receiver power
+
+The DP path reaches `DisableDpLinkMaybeD3PowerOff()` at `0x141BB85F0`.
+Unless link byte `+0x2DC` is set, it:
+
+1. writes DPCD `0x600 = 2` (`D3`);
+2. disables link output;
+3. clears cached link settings.
+
+`SetSkipPowerOffForBranchSinkOui()` at `0x141B85200` sets `+0x2DC` only for an
+active converter/dongle with branch OUI:
+
+- `0010FA`;
+- `0080E1`;
+- `00E04C`.
+
+This exactly matches Linux `dp_wa_power_up_0010FA()` and
+`dp_keep_receiver_powered`. The workaround exists because those active
+converters incorrectly lose AUX access in D3. It is not an Apple AE25/AE26 or
+AE1D/AE1E panel workaround.
+
+Conclusion: Windows normally sends receiver D3 to both Apple tiled-panel links.
+Preserving receiver D0 remains a useful diagnostic experiment, but it is not
+Windows teardown parity.
+
+#### DPCD 0x4F1
+
+No `0x4F1 = 0` operation appears in the direct mapped chain:
+
+```text
+SetPowerState
+  -> zero-stream commit
+  -> removed-pipe reset
+  -> DPMS off
+  -> DP link disable
+  -> DPCD 0x600 = D3
+```
+
+The previously identified Windows runtime literal writers assert `0x4F1 = 1`;
+none supplies a literal clear. A higher DAL topology object could still perform
+panel-private work before the DC commit, but a `0x4F1` clear is not part of the
+generic DC/link teardown. The CoreEG2 `0x4F1 = 0` destroy behavior remains a
+firmware-shaped neutralization experiment, not observed Windows runtime
+behavior.
+
+#### Linux parity assessment
+
+The current Linux path is structurally equivalent:
+
+```text
+amdgpu_pci_shutdown()
+  -> amdgpu_device_prepare()
+  -> amdgpu_device_suspend()
+  -> dm_suspend()
+  -> drm_atomic_helper_suspend()
+  -> drm_atomic_helper_disable_all()
+  -> dce110_reset_hw_ctx_wrap()
+  -> link_set_dpms_off()
+  -> dp_disable_link_phy()
+```
+
+Linux also commits all CRTCs/connectors/planes inactive, resets removed DCE110
+pipes in ascending index order, uses the same signal-specific stream/link
+ordering, and normally writes DPCD `0x600 = 2`.
+
+Conclusion: the stretched Apple boot animation is not explained by a missing
+generic Windows zero-stream commit, a different generic DPMS-off order, or
+Windows preserving receiver D0. The next discriminator is persistent reboot
+logging that proves whether Linux's existing teardown actually completes on
+both links before reset. If it does, further RE should target higher
+panel-private grouped topology state rather than ordinary DC link shutdown.
+
+#### IDA database updates
+
+The functions above were renamed and the decisive power-down, pipe-order,
+receiver-D3, and converter-workaround observations were added as comments in
+`B416406/amdkmdag.sys.i64`.

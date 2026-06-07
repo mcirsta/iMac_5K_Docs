@@ -928,6 +928,8 @@ static analysis cannot prove.
 
 ## Current Concrete Next Step
 
+Status: superseded by the 2026-06-07 `Pro/new_1` reassessment below.
+
 The next useful work is no longer another broad resource-pool diff and not
 another `0x310 = 04/05 1d 03` experiment. The raw Pro1,1 source model is now
 known: root/eDP source `5`, slave/DP source `4`.
@@ -974,3 +976,366 @@ Local Linux-tree scan result:
   with transmitter `TRANSMITTER_UNIPHY_F`/source `5`, and slave/DP object
   `0x3113` with transmitter `TRANSMITTER_UNIPHY_E`/source `4`. Its observed
   DDC raw shape is `1/0`, so do not reuse DDC `3/2` as a Pro1 gate.
+
+## 2026-06-07 `Pro/new_1` Dmesg And Kernel Reassessment
+
+Inputs:
+
+- `Pro/new_1/dmesg_Pro.txt`
+- `Pro/new_1/dmesg_19_1.txt`
+- local kernel trees:
+  - `linux-imac-5k` on `pro1-apple5k-logging` at `ee0918521`
+  - `linux-imac-5k-pro1` on `codex/pro1-apple5k-logging` at `2f54c1281`
+
+### Capture provenance
+
+The captures do not come from the checked-out `2f54c1281` behavior:
+
+- Pro reports `7.0.1-imac5k-gf7f5b1dd28ba`.
+- iMac19,1 reports `7.0.1-1-imac-5k-gada7abe5ec64`.
+- Neither reported source object exists in the local repository.
+- Both logs contain the `APPLE5K-PROBE` source/MSA/blank markers from the
+  `400f9441c..ee0918521` probe branch.
+- Both logs omit the `force_sync` panel flag, `stream MSA-ignore`,
+  `stream feature 0x107`, and `timing-sync candidate/result/apply` markers
+  introduced by `2f54c1281`.
+
+Therefore the logs are authoritative for the probe behavior, but they do not
+test the force-sync/MSA-ignore patch at local HEAD.
+
+### Runtime comparison
+
+| Plan axis | iMacPro1,1 | iMac19,1 | Assessment |
+|---|---|---|---|
+| ASIC/resource generation | Vega10, DCE12, GPU `1002:6860` | Polaris, DCE11.2, GPU `1002:67df` | expected Windows resource-pool divergence confirmed |
+| root route | link 0, DDC 1, encoder/engine 5 | link 0, DDC 3, encoder/engine 2 | Pro DCE12 route is correctly discovered |
+| slave route | link 1, DDC 0, encoder/engine 4 | link 1, DDC 2, encoder/engine 3 | Pro DCE12 route is correctly discovered |
+| FE source select | source 5 mask `0x20`; source 4 mask `0x10` | source 2 mask `0x04`; source 3 mask `0x08` | exact Windows/VBIOS source ordinals are already programmed |
+| tiled EDID construction | root becomes tile `(0,0)`, slave tile `(1,0)`, common 2x1 group | same | no Pro-only tile-group failure |
+| tile timing/MSA | both engines: active `2560x2880`, total `2720x2962`, start `112,79`, width `2560`, height `2880` | identical | no stretched-tile cause in per-stream MSA geometry |
+| framebuffer split | left source X `0`, right source X `2560`; destination/clip X local `0` | identical | matches the Windows tile-split source-mode result |
+| DP stream enable | engines 5 and 4 unblank with enable readback `1` | engines 2 and 3 do the same | no missing right-tile `DP_VID_STREAM_ENABLE` latch |
+| source table `0x310` | forced `04 1d 03`, DCE auto-first byte would be `05` | forced `04 1d 03`, auto-first is `04` | not a fixing difference; already deprioritized |
+| stream latch `0x4F1` | slave writes/readbacks `1` | same | successful latch is not sufficient to fix Pro |
+| link training | succeeds without the long initial retry sequence | one initial `enabling link 1 failed: 15`, then recovers | training is not the Pro-only failure axis |
+
+The low-level probe closes the following candidates:
+
+1. Linux is not accidentally using iMac19,1 source `2/3` on Pro.
+2. Linux is not generating a full-width or otherwise different MSA for one Pro
+   tile.
+3. Linux is not leaving the Pro right-tile stream encoder disabled.
+4. Candidate C from the tile-split handoff is already represented by the
+   right-plane source X `2560`.
+
+### Timing-sync log correction
+
+The existing stream trace labels this field:
+
+```text
+sync_enabled=0 master_link[0] event=0 delay=0
+```
+
+but the implementation prints `stream->triggered_crtc_reset.enabled` and its
+event-source fields. It does not print
+`pipe_ctx->stream_res.tg->timing_sync_info`.
+
+Consequences:
+
+- The new logs do not prove that DC timing synchronization was absent.
+- The `7b4158862` revert rationale treated `sync_enabled=0` as evidence against
+  timing grouping, but that specific field is not the Phase 6C HWSync state.
+- Phase 6C remains unresolved at runtime until the real
+  `timing_sync_info.group_id/group_size/master` state is logged.
+
+### Phase 6E correction
+
+The later static closeout in
+`RE_iMacPro1_1_IDA_MCP_Findings.md` supersedes the earlier Phase 6E
+interpretation:
+
+- HWSync passes selector `8` for the all-DP/eDP pair, or `9..14` for the mixed
+  helper path.
+- The concrete DCE12 event writer accepts only selectors `0` and `1`.
+- Provider `+0xB0` forwards the selector directly.
+- Therefore the inspected Windows HWSync source-signal helper call performs no
+  DCE12 MMIO for the Pro tile pair.
+
+There is no missing Linux class-9 helper register operation to implement.
+Grouped timing synchronization itself remains a separate question.
+
+### Latest local kernel assessment
+
+The currently checked-out `linux-imac-5k` tree is `ee0918521`. Its probe
+formats and reverted force-sync/root-repulse behavior match the new captures,
+although the packaged build hashes themselves are not present locally. This is
+the latest tested behavior represented by `Pro/new_1`.
+
+The separate `linux-imac-5k-pro1` tree is checked out at `2f54c1281`.
+`2f54c1281` adds two behaviors together:
+
+1. it sets `ignore_msa_timing_param` for every recognized Apple 5K tile and
+   writes DPCD `0x107[7]`;
+2. it forces the tiled pair into a timing-synchronization group when the
+   ordinary synchronizability check rejects it.
+
+This is aligned with two Windows RE observations:
+
+- DCE12 mode-12 generic finalization should set MSA-ignore through `0x107[7]`;
+- SetMode constructs an explicit inter-path HWSync group.
+
+However, the patch is not yet validated by these captures and its scope is
+broader than the proven divergence:
+
+- it applies to all supported Apple 5K generations, including the working
+  DCE11.2 iMac19,1;
+- it combines MSA-ignore and forced grouping, so a successful result would not
+  identify which operation matters;
+- the branch containing the new low-level probes explicitly reverts it, so no
+  single captured kernel currently contains both the probes and the real
+  timing-sync result logs.
+
+Treat `2f54c1281` as an untested experimental patch, not as a resolved fix and
+not as the baseline represented by `Pro/new_1`.
+
+### Updated priority
+
+#### P0: resolve actual DC timing grouping
+
+Build a logging-first kernel on the probe branch that reports the real
+`timing_sync_info` without changing grouping. The marker must include:
+
+```text
+APPLE5K: timing baseline pipe=%d link[%u] group_id=%d group_size=%d master=%u
+```
+
+Also retain the existing source-selection, MSA, and blank/unblank probes.
+
+Interpretation:
+
+- If baseline Pro already has a two-pipe timing group, forced grouping is not
+  the missing operation.
+- If iMac19,1 groups but Pro does not, Phase 6C becomes the first patch axis.
+- If neither groups, a Pro-only DCE12 grouping test remains justified by the
+  Windows HWSync path, but it is a generation-specific experiment rather than
+  a shared Apple-panel quirk.
+
+#### P1: test the DCE12 generic-finalizer behavior
+
+Add a Pro-only experiment for DPCD `0x107[7]` and log old/new/readback. Do not
+use the shared Apple panel-ID switch as the final scope. Gate the experiment on
+the iMacPro1,1/DCE12 identity or the `AE1D/AE1E` family.
+
+Because current DC rejects ordinary timing synchronization when either stream
+has `ignore_msa_timing_param`, combine MSA-ignore with a Pro-only timing-group
+override only after the P0 baseline reveals whether the pair was grouped
+before the flag changed.
+
+The extra slave `0x4F1` latch can remain for the first test because it has
+already proved ineffective but not harmful. Removing it is a later branch
+parity cleanup, not the first experiment.
+
+#### P2: ASSR ordering
+
+If P0/P1 do not change the symptom, add the narrow `0x10A` phase marker already
+defined in Phase 7. The new logs contain no ASSR ordering evidence.
+
+### Deprioritized after `new_1`
+
+- source ordinal/register-block selection;
+- AUX/DDC route discovery;
+- tile descriptor construction;
+- plane source split;
+- per-tile MSA width/start/totals;
+- `DP_VID_STREAM_ENABLE` persistence;
+- further `0x310 = 04/05 1d 03` trials;
+- root `0x4F1` re-pulsing;
+- generic link-training retries.
+
+## User-space exclusion assessment from `new_1`
+
+The current logs strongly exclude a user-space **modesetting, topology, or
+plane-geometry** error, but dmesg alone cannot completely exclude a
+user-space **pixel-content** error.
+
+### Kernel fbdev state before the desktop takes over
+
+Both systems initially use the in-kernel DRM client with the same aggregate
+layout:
+
+| System | Aggregate FB | Left tile | Right tile |
+|---|---:|---|---|
+| iMacPro1,1 | `FB:108`, 5120x2880 | source `(0,0) 2560x2880` | source `(2560,0) 2560x2880` |
+| iMac19,1 | `FB:96`, 5120x2880 | source `(0,0) 2560x2880` | source `(2560,0) 2560x2880` |
+
+The kernel assigns the eDP connector to the left CRTC at `(0,0)` and the DP
+connector to the right CRTC at `(2560,0)`. This state exists before a desktop
+compositor has supplied its own framebuffers.
+
+If the visible stretch is already present on the fbcon/text console during
+this interval, desktop user space is conclusively excluded.
+
+### Desktop atomic state
+
+At compositor takeover, the Pro continues to use the correct structure:
+
+- eDP remains on CRTC 70 and DP remains on CRTC 74.
+- Both CRTCs run 2560x2880 with no scaling or rotation.
+- Each output receives a separate 2560x2880 framebuffer with local source and
+  destination rectangles of `(0,0) 2560x2880`.
+- AMD DC maps the right tile into aggregate source X `2560`, while its local
+  destination and clip start at X `0`.
+- Subsequent modesets and page flips retain the same connector/CRTC mapping
+  and geometry.
+
+The working iMac19,1 follows the same per-output framebuffer model and the
+same left-X-0/right-X-2560 DC mapping. The Pro log contains no rejected desktop
+atomic check, duplicate plane source, 5120-to-2560 scaling, tile swap, missing
+CRTC, or other state that would explain a stretched left tile.
+
+The first desktop buffers differ in format/layout: the Pro uses 10-bit `AB30`
+with an AMD modifier, while the iMac19,1 initially uses linear 10-bit `XR30`.
+The Pro later also submits `XR30` while retaining correct geometry. This is a
+remaining user-space-adjacent variable, but a modifier problem would more
+typically produce corruption or incorrect addressing than a stable panel-side
+tile stretch.
+
+### Confidence boundary and decisive test
+
+The atomic trace proves the geometry and topology submitted by user space and
+accepted by DRM/DC. It does not contain framebuffer pixels or a client PID, so
+it cannot prove that a compositor did not render duplicated image content into
+two otherwise valid 2560x2880 buffers.
+
+To close that final gap, boot the Pro to a text-only target with amdgpu and
+fbcon active but without a display manager/compositor. If the stretch remains
+on that console, the issue is below desktop user space. Based on the present
+logs, the leading fault domain remains the Pro-specific kernel/DC-to-panel
+handoff rather than user-space KMS configuration.
+
+## Warm-reboot state and Windows predecessor effect
+
+The report that a Linux-to-Linux reboot can leave the left tile stretched,
+while a reboot after Windows has enabled 5K does not, materially strengthens a
+persistent panel/TCON state hypothesis.
+
+This does not yet prove that Windows performs cleanup. Two explanations fit:
+
+1. Windows shuts the pair down into a neutral state that Linux can initialize.
+2. Windows leaves a coherent, fully initialized 5K state that survives the warm
+   reset, while Linux leaves a different or only partially paired state.
+
+The second interpretation currently has stronger driver evidence.
+
+### Linux teardown facts
+
+The Linux reboot path reaches amdgpu suspend/atomic shutdown and normal DPMS
+off. For DP 1.x, `link_set_dpms_off()` blanks the stream, disables the link,
+disables the stream, and calls the panel ASSR-off path. `dp_disable_link_phy()`
+normally writes receiver power D3 before disabling source output and clearing
+the cached link settings.
+
+The Apple-specific code in the current working and Pro test trees only asserts
+the private latch with `0x4F1 = 1`. It has no matching Apple-pair shutdown
+operation that clears the latch, resets both tile endpoints as a unit, or
+verifies the state left for the next boot.
+
+Both `new_1` logs also contain repeated early DPMS-off operations on link 1
+after successful training. The following status samples still show
+`0x4F1 = 1` and slave ASSR `0x10A = 1`:
+
+| System | DPMS-off samples | Later private state |
+|---|---:|---|
+| iMacPro1,1 | 11.550690, 11.928978, 12.162462 s | `0x10A=01`, `0x4F1=01` |
+| iMac19,1 | 8.102285, 8.724242, 9.033797 s | `0x10A=01`, `0x4F1=01` |
+
+The trace does not currently log DPCD `0x600` or the exact source-register
+state at these disable points, so it cannot tell whether the receiver was put
+into D3 or whether the two source paths were disabled coherently.
+
+### Windows and firmware evidence
+
+A fresh immediate search of the BootCamp driver found eight literal `0x4F1`
+references. The display-related writers all send payload `1`; no direct
+driver-side literal `0x4F1 = 0` writer was found.
+
+Windows does have behavior Linux does not model as an Apple tile-pair
+lifecycle:
+
+- ordered pre/post stream-disable topology notifications;
+- an optional PPLIB command-38 display-power-policy refresh;
+- `DisableDpLinkMaybeD3PowerOff()`, where DPCD `0x600 = 2` is conditional and
+  can be skipped for selected sink/branch policy;
+- reverse child-path processing during blank/disable;
+- cached/already-configured stream paths that avoid destructive retraining or
+  receiver power-down.
+
+Apple firmware CoreEG2 does have explicit `0x4F1 = 0` pre-pass and
+display-object-destroy paths. That makes latch clear a valid firmware-shaped
+experiment, but it is not evidence that the Windows runtime driver performs
+the same clear on reboot.
+
+### Relationship to the Pro1,1 failure
+
+This can plausibly be the same fault family as the Pro stretched-left-tile
+failure:
+
+- the submitted KMS geometry and per-tile MSA are correct;
+- both stream encoders are enabled;
+- the symptom is consistent with panel-side tile/split state;
+- the state can survive a warm reboot;
+- Windows uses paired lifecycle, timing, source, and power-state decisions that
+  Linux currently handles as mostly independent DP links.
+
+It is not yet proven to be the identical cause. The decisive observation is
+whether the Pro symptom changes with predecessor state: Windows -> Linux,
+Linux -> Linux, and true cold AC removal -> Linux.
+
+### P0 experiment matrix
+
+Run the same kernel and mode in this order, recording whether the defect is
+visible on fbcon before the compositor:
+
+| Case | Predecessor and transition |
+|---|---|
+| A | remove AC power long enough for panel state to decay, then boot Linux |
+| B | Windows reaches 5K, then warm reboot directly into Linux |
+| C | Linux reaches 5K, then warm reboot directly into the same Linux kernel |
+| D | Linux reaches 5K, performs a full shutdown, then boot without removing AC |
+| E | Linux reaches 5K, shuts down, remove AC, then boot Linux |
+
+Before any Apple-specific boot write, snapshot both links:
+
+- DPCD `0x100..0x10A`, especially `0x101`, `0x102`, `0x103`, and `0x107`;
+- `0x111`;
+- lane/sink status `0x202..0x207`;
+- source/private range `0x300..0x317`, especially `0x310` and `0x316`;
+- `0x4F0..0x4F2`;
+- receiver power `0x600`.
+
+At shutdown, log the same state before teardown and after each of: stream
+blank, stream disable, source-output disable, receiver D3, and final amdgpu
+suspend. Include source/TG enable and timing-sync registers for both paths.
+
+### Narrow test branches
+
+Test only one change at a time on the exact Apple tile pair:
+
+1. **Shutdown preserve:** skip the destructive receiver-D3/source teardown only
+   during reboot. If Linux -> Linux becomes good, teardown is creating the bad
+   residual state.
+2. **Firmware-shaped cleanup:** write/read back root `0x4F1 = 0`, wait, then
+   perform the normal paired shutdown. This tests CoreEG2-style neutralization;
+   do not describe it as Windows behavior.
+3. **Deterministic boot reset:** if neither shutdown branch is decisive, reset
+   both endpoints at boot and rebuild the pair from D0, source DPCD, ASSR,
+   training, timing/source synchronization, and final latch in one controlled
+   sequence.
+
+Do not combine this with the Pro timing-sync or `0x107[7]` experiments. The
+predecessor matrix and logging-only kernel should run first so inherited state
+is not mistaken for the effect of another patch.
+
+The implementation-ready execution plan, including the shutdown hook, safety
+gate, persistent instrumentation, Windows callback anchors, and acceptance
+matrix, is in `Apple5K_Warm_Reboot_Parity_Plan.md`.
